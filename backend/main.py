@@ -155,6 +155,35 @@ def init_cloudinary() -> bool:
         return True
     return False
 
+
+def upload_to_cloudinary(
+    content: bytes,
+    filename: str,
+    resource_type: str = "raw",
+) -> dict[str, Any]:
+    if not init_cloudinary():
+        raise RuntimeError("Cloudinary is not configured")
+
+    suffix = Path(filename).suffix.lower()
+    public_id = f"{uuid.uuid4().hex}{suffix}"
+
+    result = cloudinary.uploader.upload(
+        content,
+        resource_type=resource_type,
+        folder=f"{CLOUDINARY_UPLOAD_FOLDER}/documents",
+        public_id=public_id,
+        overwrite=False,
+    )
+
+    return {
+        "public_id": result["public_id"],
+        "secure_url": result["secure_url"],
+        "resource_type": result.get("resource_type", resource_type),
+        "format": result.get("format", suffix.lstrip(".")),
+        "bytes": result.get("bytes", len(content)),
+    }
+
+
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
