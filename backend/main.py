@@ -1,0 +1,7365 @@
+from __future__ import annotations
+
+import hashlib
+import hmac
+import io
+import json
+import logging
+import os
+import random
+import re
+import secrets
+import smtplib
+import sqlite3
+import time
+import uuid
+from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
+from email.message import EmailMessage
+from pathlib import Path
+from typing import Any, Iterator
+from urllib.parse import urlencode, urlparse
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import httpx
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, EmailStr, Field, field_validator
+try:
+    from slowapi import Limiter, _rate_limit_exceeded_handler
+    from slowapi.errors import RateLimitExceeded
+    from slowapi.util import get_remote_address
+    HAS_SLOWAPI = True
+except ImportError:
+    HAS_SLOWAPI = False
+
+    class RateLimitExceeded(Exception):
+        pass
+
+    class Limiter:  # type: ignore[no-redef]
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            pass
+
+        def limit(self, *args: Any, **kwargs: Any) -> Any:
+            def decorator(func: Any) -> Any:
+                return func
+            return decorator
+
+    def get_remote_address(request: Request) -> str:  # type: ignore[no-redef]
+        return "127.0.0.1"
+
+    def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> JSONResponse:  # type: ignore[no-redef]
+        return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded"})
+from starlette.concurrency import run_in_threadpool
+try:
+    import cloudinary
+    import cloudinary.uploader
+    import cloudinary.utils
+    HAS_CLOUDINARY = True
+except ImportError:
+    HAS_CLOUDINARY = False
+
+ROOT = Path(__file__).resolve().parents[1]
+FRONTEND_DIR = ROOT / "frontend"
+DATA_DIR = Path(os.environ.get("SKILLSPHERE_DATA_DIR", ROOT / "data")).resolve()
+UPLOAD_DIR = DATA_DIR / "uploads"
+QUESTION_BANK_UPLOAD_DIR = DATA_DIR / "question_bank_uploads"
+RECORDINGS_STORAGE_DIR = DATA_DIR / "recordings"
+RECORDINGS_STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH = DATA_DIR / "skillsphere.sqlite3"
+MAX_RESUME_BYTES = 10 * 1024 * 1024
+MAX_QUESTION_BANK_PDF_BYTES = 10 * 1024 * 1024
+MAX_QUESTION_BANK_PDF_PAGES = 40
+IS_PRODUCTION = os.environ.get("SKILLSPHERE_ENV", "development").lower() == "production"
+TOKEN_SECRET = os.environ.get("SKILLSPHERE_SECRET_KEY")
+if IS_PRODUCTION and not TOKEN_SECRET:
+    raise RuntimeError("Set SKILLSPHERE_SECRET_KEY to a unique secret before starting in production")
+TOKEN_SECRET = TOKEN_SECRET or "local-development-only-change-before-deploying"
+TOKEN_TTL_SECONDS = 60 * 60 * 12
+ASSESSMENT_TTL_HOURS = int(os.environ.get("SKILLSPHERE_ASSESSMENT_TTL_HOURS", "48"))
+ASSESSMENT_DURATION_MINUTES = int(os.environ.get("SKILLSPHERE_ASSESSMENT_DURATION_MINUTES", "30"))
+if ASSESSMENT_TTL_HOURS < 1 or ASSESSMENT_DURATION_MINUTES < 1:
+    raise RuntimeError("Assessment TTL and duration settings must be positive integers")
+try:
+    ROUND1_PASS_PERCENTAGE = float(os.environ.get("SKILLSPHERE_ROUND1_PASS_PERCENTAGE", "75"))
+except ValueError as error:
+    raise RuntimeError("SKILLSPHERE_ROUND1_PASS_PERCENTAGE must be a number from 0 to 100") from error
+if not 0 <= ROUND1_PASS_PERCENTAGE <= 100:
+    raise RuntimeError("SKILLSPHERE_ROUND1_PASS_PERCENTAGE must be a number from 0 to 100")
+ROUND1_ASSESSMENT_NAME = "Round 1: Technical MCQ Test"
+PUBLIC_BASE_URL = os.environ.get("SKILLSPHERE_PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
+
+
+def environment_bool(name: str, default: str) -> bool:
+    value = os.environ.get(name, default).lower()
+    if value not in {"true", "false"}:
+        raise RuntimeError(f"{name} must be true or false")
+    return value == "true"
+
+
+PROCTORING_REQUIRED = environment_bool("SKILLSPHERE_PROCTORING_REQUIRED", "true")
+try:
+    PROCTORING_FACE_MISSING_SECONDS = int(
+        os.environ.get("SKILLSPHERE_PROCTORING_FACE_MISSING_SECONDS")
+        or os.environ.get("SKILLSPHERE_FACE_MISSING_WARNING_SECONDS")
+        or "10"
+    )
+    PROCTORING_MAX_WARNINGS = int(
+        os.environ.get("SKILLSPHERE_PROCTORING_MAX_WARNINGS")
+        or os.environ.get("SKILLSPHERE_MAX_PROCTORING_WARNINGS")
+        or "3"
+    )
+except ValueError as error:
+    raise RuntimeError("Proctoring warning thresholds must be positive integers") from error
+
+_auto_submit_val = (
+    os.environ.get("SKILLSPHERE_PROCTORING_AUTO_SUBMIT")
+    or os.environ.get("SKILLSPHERE_AUTO_SUBMIT_ON_MAX_WARNINGS")
+    or "false"
+).lower()
+PROCTORING_AUTO_SUBMIT = _auto_submit_val == "true"
+if PROCTORING_FACE_MISSING_SECONDS < 1 or PROCTORING_MAX_WARNINGS < 1:
+    raise RuntimeError("Proctoring warning thresholds must be positive integers")
+
+# ---------------------------------------------------------------------------
+# Cloudinary & Assessment Video Recording configuration
+# ---------------------------------------------------------------------------
+CLOUDINARY_CLOUD_NAME = os.environ.get("CLOUDINARY_CLOUD_NAME", "").strip()
+CLOUDINARY_API_KEY = os.environ.get("CLOUDINARY_API_KEY", "").strip()
+CLOUDINARY_API_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "").strip()
+CLOUDINARY_UPLOAD_FOLDER = os.environ.get("CLOUDINARY_UPLOAD_FOLDER", "skillsphere/assessment-recordings").strip()
+SKILLSPHERE_RECORDING_REQUIRED = environment_bool("SKILLSPHERE_RECORDING_REQUIRED", "true")
+SKILLSPHERE_CLOUDINARY_ENABLED = environment_bool("SKILLSPHERE_CLOUDINARY_ENABLED", "true")
+
+try:
+    SKILLSPHERE_RECORDING_MAX_UPLOAD_MB = int(os.environ.get("SKILLSPHERE_RECORDING_MAX_UPLOAD_MB", "100"))
+    SKILLSPHERE_RECORDING_RETENTION_DAYS = int(os.environ.get("SKILLSPHERE_RECORDING_RETENTION_DAYS", "30"))
+except ValueError:
+    SKILLSPHERE_RECORDING_MAX_UPLOAD_MB = 100
+    SKILLSPHERE_RECORDING_RETENTION_DAYS = 30
+
+
+def init_cloudinary() -> bool:
+    if not HAS_CLOUDINARY or not SKILLSPHERE_CLOUDINARY_ENABLED:
+        return False
+    if CLOUDINARY_CLOUD_NAME and CLOUDINARY_API_KEY and CLOUDINARY_API_SECRET:
+        cloudinary.config(
+            cloud_name=CLOUDINARY_CLOUD_NAME,
+            api_key=CLOUDINARY_API_KEY,
+            api_secret=CLOUDINARY_API_SECRET,
+            secure=True
+        )
+        return True
+    return False
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Allowed CORS origins — add your production domain here or set via env var
+# e.g. SKILLSPHERE_CORS_ORIGINS="https://app.example.com,https://www.example.com"
+# ---------------------------------------------------------------------------
+_raw_origins = os.environ.get("SKILLSPHERE_CORS_ORIGINS", "")
+CORS_ORIGINS: list[str] = (
+    [o.strip() for o in _raw_origins.split(",") if o.strip()]
+    if _raw_origins
+    else (["*"] if not IS_PRODUCTION else [PUBLIC_BASE_URL])
+)
+
+# ---------------------------------------------------------------------------
+# Rate limiter (slowapi) — limits applied per remote IP
+# ---------------------------------------------------------------------------
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
+
+app = FastAPI(title="SkillSphere API", version="1.0.0")
+
+# CORS — must be added before routes
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(RequestValidationError)
+def custom_validation_error_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+    for err in exc.errors():
+        msg = err.get("msg", "")
+        if "Job description must contain at least 20 characters before you can post this job." in msg:
+            return JSONResponse(
+                status_code=422,
+                content={"detail": "Job description must contain at least 20 characters before you can post this job."},
+            )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next: Any) -> Any:
+    path = request.url.path
+    exempt = (
+        request.method in {"GET", "HEAD", "OPTIONS"}
+        or path.startswith("/api/assessments/")
+        or path in {"/api/auth/login", "/api/auth/register", "/api/auth/csrf"}
+    )
+    if not exempt:
+        has_cookie = AUTH_COOKIE_NAME in request.cookies
+        has_bearer = bool(request.headers.get("authorization"))
+        header = request.headers.get("x-csrf-token") or request.headers.get("x-xsrf-token") or ""
+        cookie = request.cookies.get(CSRF_COOKIE_NAME, "")
+        if has_cookie and not has_bearer and (not cookie or not header or not hmac.compare_digest(cookie, header)):
+            return JSONResponse({"detail": "CSRF token is required for cookie-authenticated requests."}, status_code=403)
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(self), microphone=(), geolocation=()")
+    if _is_production():
+        response.headers.setdefault("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+    return response
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next: Any) -> Any:
+    start_time = time.time()
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        response.headers["X-Process-Time"] = f"{duration:.4f}"
+        return response
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Unhandled error on %s %s: %s", request.method, request.url.path, exc)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "An internal server error occurred. Please try again later."},
+        )
+
+if not IS_PRODUCTION:
+    logger.warning(
+        "Running in DEVELOPMENT mode. "
+        "Set SKILLSPHERE_ENV=production and SKILLSPHERE_SECRET_KEY before deploying."
+    )
+
+
+def now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def add_notification(
+    db: sqlite3.Connection,
+    user_id: int,
+    notification_type: str,
+    title: str,
+    message: str,
+    *,
+    application_id: int | None = None,
+    assessment_id: int | None = None,
+    action_url: str = "",
+    email_delivery_status: str = "Not Sent",
+) -> int:
+    cursor = db.execute(
+        """INSERT INTO notifications
+        (user_id, type, title, message, related_application_id, related_assessment_id,
+         action_url, email_delivery_status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            user_id, notification_type, title, message, application_id,
+            assessment_id, action_url, email_delivery_status, now(),
+        ),
+    )
+    return cursor.lastrowid
+
+
+def email_notification(db: sqlite3.Connection, user_id: int, title: str, message: str) -> str:
+    user = db.execute("SELECT email FROM users WHERE id = ?", (user_id,)).fetchone()
+    if not user:
+        return "Failed"
+    host = os.environ.get("SKILLSPHERE_SMTP_HOST", "")
+    if not host:
+        if IS_PRODUCTION:
+            logger.error("Notification email delivery is unavailable because SMTP is not configured")
+            return "Failed"
+        return "Development"
+    sender = os.environ.get("SKILLSPHERE_SMTP_FROM") or os.environ.get("SKILLSPHERE_SMTP_USERNAME")
+    username = os.environ.get("SKILLSPHERE_SMTP_USERNAME", "")
+    password = os.environ.get("SKILLSPHERE_SMTP_PASSWORD", "")
+    if not sender or (username and not password):
+        logger.error("Notification email configuration is incomplete")
+        return "Failed"
+    email = EmailMessage()
+    email["Subject"] = title
+    email["From"] = sender
+    email["To"] = user["email"]
+    email.set_content(message)
+    try:
+        port = int(os.environ.get("SKILLSPHERE_SMTP_PORT", "587"))
+        if port == 465:
+            with smtplib.SMTP_SSL(host, port, timeout=20) as server:
+                if username:
+                    server.login(username, password)
+                server.send_message(email)
+        else:
+            with smtplib.SMTP(host, port, timeout=20) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                if username:
+                    server.login(username, password)
+                server.send_message(email)
+        return "Sent"
+    except (OSError, smtplib.SMTPException):
+        logger.exception("Could not send notification email")
+        return "Failed"
+
+
+def notify_user(
+    db: sqlite3.Connection,
+    user_id: int,
+    notification_type: str,
+    title: str,
+    message: str,
+    *,
+    application_id: int | None = None,
+    assessment_id: int | None = None,
+    email: bool = False,
+    action_url: str = "",
+) -> int:
+    delivery = email_notification(db, user_id, title, message) if email else "Not Sent"
+    notification_id = add_notification(
+        db, user_id, notification_type, title, message,
+        application_id=application_id, assessment_id=assessment_id,
+        email_delivery_status=delivery, action_url=action_url,
+    )
+    if delivery == "Failed":
+        admins = db.execute("SELECT id FROM users WHERE role = 'admin' AND active = 1").fetchall()
+        for admin in admins:
+            add_notification(
+                db, admin["id"], "email_failure", "Notification email failed",
+                f"Email notification delivery failed for a {notification_type} update.",
+                application_id=application_id, assessment_id=assessment_id,
+            )
+    return notification_id
+
+
+def record_application_status(
+    db: sqlite3.Connection,
+    application_id: int,
+    status: str,
+    actor: dict[str, Any] | None,
+    note: str = "",
+) -> None:
+    db.execute(
+        """INSERT INTO application_status_history
+        (application_id, status, actor_id, actor_role, note, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)""",
+        (application_id, status, actor["id"] if actor else None, actor["role"] if actor else "system", note, now()),
+    )
+
+
+@contextmanager
+def connect() -> Iterator[sqlite3.Connection]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA journal_mode=WAL")       # concurrent reads + writes
+    connection.execute("PRAGMA synchronous=NORMAL")     # safe & faster than FULL
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.execute("PRAGMA cache_size=-8000")       # ~8 MB page cache
+    connection.execute("PRAGMA temp_store=MEMORY")
+    try:
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def password_hash(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    result = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 180_000)
+    return f"{salt.hex()}:{result.hex()}"
+
+
+def check_password(password: str, encoded: str) -> bool:
+    try:
+        salt, expected = encoded.split(":", 1)
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), bytes.fromhex(salt), 180_000)
+        return hmac.compare_digest(actual.hex(), expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def encode_token(user: sqlite3.Row | dict[str, Any]) -> str:
+    import base64
+
+    header = base64.urlsafe_b64encode(b'{"alg":"HS256","typ":"JWT"}').rstrip(b"=").decode()
+    payload = {
+        "sub": user["id"],
+        "role": user["role"],
+        "exp": int(time.time()) + TOKEN_TTL_SECONDS,
+    }
+    body = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).rstrip(b"=").decode()
+    signature = hmac.new(TOKEN_SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest()
+    signed = base64.urlsafe_b64encode(signature).rstrip(b"=").decode()
+    return f"{header}.{body}.{signed}"
+
+
+AUTH_COOKIE_NAME = "skillsphere_session"
+CSRF_COOKIE_NAME = "skillsphere_csrf"
+COOKIE_PATH = "/"
+
+
+def _is_production() -> bool:
+    return os.environ.get("SKILLSPHERE_ENV", "development").lower() == "production"
+
+
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def auth_cookie_settings() -> dict[str, Any]:
+    return {"httponly": True, "secure": _is_production(), "samesite": "Lax", "path": COOKIE_PATH, "max_age": TOKEN_TTL_SECONDS}
+
+
+def csrf_cookie_settings() -> dict[str, Any]:
+    return {"httponly": False, "secure": _is_production(), "samesite": "Lax", "path": COOKIE_PATH, "max_age": TOKEN_TTL_SECONDS}
+
+
+def websocket_auth_token(websocket: WebSocket, token: str = "") -> str:
+    """Return a token from ?token= (legacy) or the HttpOnly session cookie.
+
+    Cookie-based sockets must come from the same origin (prevents cross-site WebSocket hijacking).
+    """
+    if token:
+        return token
+    cookie = websocket.cookies.get(AUTH_COOKIE_NAME, "")
+    if not cookie:
+        return ""
+    origin = websocket.headers.get("origin", "")
+    host = websocket.headers.get("host", "")
+    if origin and urlparse(origin).netloc != host:
+        return ""
+    return cookie
+
+
+def decode_token(token: str) -> dict[str, Any]:
+    import base64
+
+    try:
+        header, body, signature = token.split(".")
+        expected = hmac.new(TOKEN_SECRET.encode(), f"{header}.{body}".encode(), hashlib.sha256).digest()
+        actual = base64.urlsafe_b64decode(signature + "=" * (-len(signature) % 4))
+        if not hmac.compare_digest(expected, actual):
+            raise ValueError("Invalid signature")
+        payload = json.loads(base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)))
+        if payload.get("exp", 0) <= time.time():
+            raise ValueError("Expired token")
+        return payload
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise HTTPException(status_code=401, detail="Invalid or expired authentication token") from error
+
+
+def public_user(row: sqlite3.Row) -> dict[str, Any]:
+    user = dict(row)
+    user.pop("password_hash", None)
+    try:
+        user["profile"] = json.loads(user.pop("profile_json") or "{}")
+    except (json.JSONDecodeError, KeyError, TypeError):
+        user["profile"] = {}
+    return user
+
+
+def get_current_user(authorization: str | None = None, token: str | None = None) -> dict[str, Any]:
+    provided = token or authorization
+    if not provided:
+        raise HTTPException(status_code=401, detail="Sign in to continue")
+    if provided.startswith("Bearer "):
+        provided = provided[7:]
+    payload = decode_token(provided)
+    with connect() as db:
+        row = db.execute("SELECT * FROM users WHERE id = ?", (payload.get("sub"),)).fetchone()
+    if not row or not row["active"]:
+        raise HTTPException(status_code=401, detail="Account no longer exists")
+    return public_user(row)
+
+
+def current_user(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if authorization:
+        return get_current_user(authorization=authorization)
+    cookie = request.cookies.get(AUTH_COOKIE_NAME)
+    if not cookie:
+        raise HTTPException(status_code=401, detail="Sign in to continue")
+    return get_current_user(token=cookie)
+
+
+def require_role(*roles: str):
+    def dependency(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+        if user["role"] not in roles:
+            raise HTTPException(status_code=403, detail="This action is not available for your account")
+        return user
+
+    return dependency
+
+
+class RegisterBody(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    email: EmailStr
+    password: str = Field(min_length=8, max_length=128)
+    role: str = "candidate"
+
+
+class LoginBody(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class JobBody(BaseModel):
+    title: str = Field(min_length=2, max_length=120)
+    company: str = Field(min_length=2, max_length=100)
+    description: str = Field(default="", max_length=10_000)
+    location: str = Field(min_length=2, max_length=100)
+    experience: str = Field(min_length=2, max_length=80)
+    job_type: str = Field(default="Full-time", max_length=30)
+    salary: str = Field(default="", max_length=80)
+    skills: list[str] = Field(min_length=1, max_length=30)
+    assessment_question_count: int = Field(default=20, ge=5, le=50)
+    allow_detailed_results: bool = True
+
+    @field_validator("description")
+    @classmethod
+    def validate_description(cls, v: str) -> str:
+        if len((v or "").strip()) < 20:
+            raise ValueError("Job description must contain at least 20 characters before you can post this job.")
+        return v.strip()
+
+
+class AssessmentDecisionBody(BaseModel):
+    decision: str = Field(pattern="^(Pass|Fail)$")
+    notes: str = Field(default="", max_length=1000)
+
+
+class JobAssessmentSettingsBody(BaseModel):
+    assessment_question_count: int = Field(default=20, ge=5, le=50)
+    allow_detailed_results: bool = True
+
+
+class StatusBody(BaseModel):
+    status: str
+
+
+class ProfileBody(BaseModel):
+    name: str = Field(min_length=2, max_length=100)
+    profile: dict[str, Any] = Field(default_factory=dict)
+
+
+class UserStatusBody(BaseModel):
+    active: bool
+
+
+class JobStatusBody(BaseModel):
+    status: str
+
+
+class MatchBody(BaseModel):
+    job_id: int
+
+
+class AssessmentTopicBody(BaseModel):
+    technology: str = Field(min_length=1, max_length=50)
+
+
+class AssessmentSubmitBody(BaseModel):
+    answers: dict[int, int] = Field(max_length=100)
+
+
+class AssessmentProctoringStartBody(BaseModel):
+    consent_given: bool
+    camera_permission_granted: bool
+    recording_consent_given: bool = True
+    recording_consent_version: str = Field(default="1.0", max_length=20)
+
+
+class AssessmentRecordingStartBody(BaseModel):
+    consent: bool
+    consent_version: str = Field(default="1.0", max_length=20)
+
+
+class AssessmentRecordingCompleteBody(BaseModel):
+    duration_seconds: int = Field(default=0, ge=0, le=86400)
+
+
+class AssessmentProctoringEventBody(BaseModel):
+    event_type: str = Field(pattern="^(camera_granted|camera_denied|assessment_started|face_missing|face_returned|multiple_faces|single_face_restored|tab_hidden|window_blur|window_focus|camera_stopped|recording_started|recording_stopped|recording_failed)$")
+    duration_seconds: int | None = Field(default=None, ge=0, le=3600)
+
+
+class QuestionBody(BaseModel):
+    technology: str = Field(min_length=1, max_length=50)
+    question: str = Field(min_length=10, max_length=1000)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    difficulty: str = Field(pattern="^(Easy|Medium|Hard)$")
+    active: bool = True
+    explanation: str = Field(default="", max_length=2000)
+    learning_resource_url: str = Field(default="", max_length=1000)
+    subtopic: str = Field(default="", max_length=100)
+
+    @field_validator("explanation", "learning_resource_url", "subtopic", mode="before")
+    @classmethod
+    def sanitize_question_fields(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v)
+
+
+class QuestionUpdateBody(QuestionBody):
+    pass
+
+
+class AIQuestionGenerateBody(BaseModel):
+    technology: str = Field(min_length=1, max_length=50)
+    count: int = Field(default=5, ge=1, le=20)
+    difficulty: str = Field(default="Mixed", pattern="^(Mixed|Easy|Medium|Hard)$")
+    subtopic: str | None = Field(default="", max_length=100)
+    custom_prompt: str | None = Field(default="", max_length=500)
+
+    @field_validator("subtopic", "custom_prompt", mode="before")
+    @classmethod
+    def sanitize_optional_str(cls, v: Any) -> str:
+        if v is None:
+            return ""
+        return str(v).strip()
+
+
+class QuestionBatchBody(BaseModel):
+    questions: list[QuestionBody] = Field(min_length=1, max_length=50)
+
+
+class QuestionImportItem(BaseModel):
+    source_index: int = Field(ge=0)
+    technology: str = Field(min_length=1, max_length=50)
+    difficulty: str = Field(pattern="^(Easy|Medium|Hard)$")
+    question: str = Field(min_length=10, max_length=1000)
+    options: list[str] = Field(min_length=4, max_length=4)
+    correct_index: int = Field(ge=0, le=3)
+    explanation: str = Field(default="", max_length=2000)
+    learning_resource_url: str = Field(default="", max_length=1000)
+    subtopic: str = Field(default="", max_length=100)
+    include: bool = True
+
+
+class QuestionImportConfirmBody(BaseModel):
+    questions: list[QuestionImportItem] = Field(max_length=500)
+
+
+class ApplicationStatusBody(BaseModel):
+    status: str
+    note: str = Field(default="", max_length=2000)
+
+
+class InternalNoteBody(BaseModel):
+    note: str = Field(max_length=4000)
+
+
+class NotificationReadBody(BaseModel):
+    is_read: bool = True
+
+
+class InterviewBody(BaseModel):
+    application_id: int
+    scheduled_at: str = Field(min_length=10, max_length=40)
+    teams_url: str = Field(min_length=1, max_length=2048, strip_whitespace=True)
+
+
+class InterviewInvitationBody(BaseModel):
+    scheduled_at: str = Field(min_length=10, max_length=40)
+    timezone: str = Field(min_length=1, max_length=80)
+    duration_minutes: int = Field(ge=5, le=480)
+    meeting_platform: str = Field(pattern="^(Google Meet|Microsoft Teams|Zoom|Other)$")
+    meeting_url: str = Field(min_length=1, max_length=2048, strip_whitespace=True)
+    recruiter_message: str = Field(default="", max_length=2000)
+
+
+class InterviewUpdateBody(BaseModel):
+    scheduled_at: str | None = Field(default=None, min_length=10, max_length=40)
+    timezone: str | None = Field(default=None, min_length=1, max_length=80)
+    duration_minutes: int | None = Field(default=None, ge=5, le=480)
+    meeting_platform: str | None = Field(default=None, pattern="^(Google Meet|Microsoft Teams|Zoom|Other)$")
+    meeting_url: str | None = Field(default=None, min_length=1, max_length=2048, strip_whitespace=True)
+    recruiter_message: str | None = Field(default=None, max_length=2000)
+
+
+class InterviewWorkspaceBody(BaseModel):
+    code: str = Field(max_length=50_000)
+    language: str = Field(default="python", pattern="^(python|javascript|typescript|java|cpp)$")
+
+
+ASSESSMENT_QUESTION_BANK: dict[str, list[tuple[str, str, str, str, str, str]]] = {
+    "Python": [
+        ("Which built-in collection is immutable?", "tuple", "list", "dict", "set", "easy"),
+        ("What does a list comprehension create?", "A new list", "A generator only", "A dictionary", "A function", "easy"),
+        ("What does dict.get('key', default) return when key is absent?", "The supplied default", "Always None", "A KeyError", "The dictionary itself", "easy"),
+        ("Which statement is commonly used to manage a file handle safely?", "with", "global", "assert", "yield", "easy"),
+        ("Which block catches an exception?", "except", "ensure", "rescue", "catching", "easy"),
+        ("Why should mutable default arguments be avoided?", "They are shared between calls", "They cannot be modified", "They are copied on every call", "They prevent recursion", "medium"),
+        ("What does the 'is' operator compare?", "Object identity", "String contents only", "Numeric magnitude", "Types only", "medium"),
+        ("What does a function containing yield produce when called?", "A generator", "A list", "A coroutine in every case", "A class", "medium"),
+        ("How should a file opened for reading be closed reliably?", "Use a with statement", "Call del on the variable", "Wait for garbage collection", "Call flush only", "easy"),
+        ("What is a primary purpose of a virtual environment?", "Isolate project dependencies", "Encrypt source code", "Compile Python to Java", "Replace the interpreter", "easy"),
+        ("What does *args collect in a function definition?", "Extra positional arguments", "Extra keyword arguments", "Return values", "Module names", "medium"),
+        ("What does **kwargs collect in a function definition?", "Extra keyword arguments", "Extra positional arguments", "Only integer arguments", "The function's annotations", "medium"),
+        ("In CPython, what does the GIL generally protect?", "Execution of Python bytecode by one thread at a time", "All files on disk", "Every database transaction", "The network socket layer", "hard"),
+        ("What property makes a set useful for membership checks?", "It stores unique hashable elements", "It preserves duplicate values", "It stores only strings", "It sorts values automatically", "easy"),
+        ("What is __init__ commonly used for?", "Initialize a new instance", "Destroy a module", "Declare a package", "Handle every exception", "easy"),
+        ("What does items[1:4] select?", "Indices 1, 2, and 3", "Indices 1 through 4 inclusive", "Only index 4", "The first four items", "medium"),
+        ("What does import package.module do?", "Makes a module available to the current code", "Installs a package from the internet", "Runs its test suite", "Creates a virtual environment", "easy"),
+        ("What does an f-string allow?", "Expression interpolation in a string", "Automatic SQL escaping", "File compression", "Type checking at runtime", "easy"),
+        ("What is the main purpose of a type hint?", "Communicate expected types to tools and readers", "Convert every value at runtime", "Prevent all exceptions", "Make a function private", "easy"),
+        ("When does a finally block normally run?", "After try/except processing, including when an exception propagates", "Only when no exception occurs", "Only after return from the module", "Before the try block", "medium"),
+    ],
+    "Java": [
+        ("What does the Java compiler normally produce for the JVM?", "Bytecode", "Native source code", "An HTML document", "A database schema", "easy"),
+        ("Which method signature is the standard Java application entry point?", "public static void main(String[] args)", "public void start(String args)", "static int main()", "private static run()", "easy"),
+        ("What is true of Java String objects?", "They are immutable", "They are always mutable", "They can contain only ASCII", "They are primitive types", "easy"),
+        ("For objects, what does == compare?", "Reference identity", "All field values recursively", "Only class names", "The hash code strings", "medium"),
+        ("Which method is conventionally used to compare String contents?", "equals", "compareReference", "same", "matchAddress", "easy"),
+        ("What can an interface primarily define?", "A contract of methods and constants", "A directly instantiated object", "Only private fields", "A database connection", "easy"),
+        ("What is method overloading?", "Same method name with different parameter lists", "Replacing a parent method with same signature", "Changing a field's access", "Calling a method recursively", "medium"),
+        ("What is method overriding?", "Providing a subclass implementation of an inherited method", "Adding a method with different parameters", "Creating a static import", "Overloading a constructor only", "medium"),
+        ("What is a checked exception?", "An exception the compiler requires code to catch or declare", "An exception that cannot be thrown", "A syntax warning", "An unchecked cast", "medium"),
+        ("Which collection is a resizable indexed list implementation?", "ArrayList", "HashSet", "TreeMap", "Optional", "easy"),
+        ("What is a common property of HashMap keys?", "Keys are unique", "Duplicate keys create multiple entries", "Keys must be integers", "Keys are always sorted", "easy"),
+        ("What does final mean on a local variable?", "It can be assigned only once", "It is visible in every package", "It is always null", "It becomes a class", "medium"),
+        ("What does static indicate for a method?", "The method belongs to the class, not an instance", "The method cannot be called", "The method is always abstract", "The method runs in a new thread", "easy"),
+        ("Which concept hides implementation details behind a public interface?", "Encapsulation", "Serialization", "Compilation", "Iteration", "easy"),
+        ("What does class inheritance allow?", "A subclass to derive behavior from a superclass", "A class to extend multiple classes", "An object to change its class at runtime", "An interface to store instance state only", "easy"),
+        ("When is a constructor called?", "When an instance is created", "Whenever a field is read", "At the end of every method", "Only when the JVM exits", "easy"),
+        ("What does try-with-resources do?", "Closes declared resources automatically", "Retries every failed operation", "Rolls back every database", "Suppresses all exceptions", "medium"),
+        ("What do Java generics provide?", "Compile-time type-safe parameterized types", "Automatic network serialization", "Runtime source compilation", "Multiple class inheritance", "medium"),
+        ("What does a reference variable contain before initialization?", "null", "An empty object", "A zero-length string", "A default instance", "easy"),
+        ("What does a lambda expression represent in Java?", "A concise implementation of a functional interface", "A new package", "A checked exception", "A database table", "medium"),
+    ],
+    "JavaScript/React": [
+        ("Can a variable declared with const be reassigned?", "No", "Yes, at any time", "Only inside a loop", "Only after await", "easy"),
+        ("What does === compare?", "Value and type without coercion", "Only string representations", "Object property counts", "Reference names", "easy"),
+        ("What is a key property of let?", "It is block-scoped", "It is always global", "It cannot be reassigned", "It declares a class", "easy"),
+        ("What does a Promise represent?", "A value that may be available asynchronously", "A synchronous loop", "A DOM element", "A module export only", "easy"),
+        ("What does await do inside an async function?", "Waits for a promise to settle and evaluates its result", "Creates a new thread", "Converts a value to JSON", "Stops the browser event loop", "medium"),
+        ("What does Array.prototype.map return?", "A new array of transformed elements", "The original array only", "A boolean", "A Set", "easy"),
+        ("Why should a React list item have a stable key?", "To help React identify items across renders", "To encrypt its props", "To prevent all rerenders", "To set its CSS class", "medium"),
+        ("What does the React useState hook provide?", "A state value and a state update function", "A router and network client", "A DOM node only", "A CSS stylesheet", "easy"),
+        ("How should a component treat its props?", "As read-only inputs", "As globally mutable state", "As browser storage", "As database rows", "easy"),
+        ("When does useEffect with an empty dependency array normally run?", "After the component's initial render", "Before every keystroke", "Only when the component unmounts", "During module parsing", "medium"),
+        ("What is a controlled React input?", "An input whose value is driven by component state", "An input with no event handler", "An input rendered only on the server", "An input that cannot change", "medium"),
+        ("How can a React event handler be passed to a button?", "onClick={handleClick}", "click=handleClick()", "event.onclick: handleClick", "onClick='handleClick'", "easy"),
+        ("What does an arrow function inherit lexically?", "The surrounding this value", "A new this value per call", "The global document", "The caller's return value", "medium"),
+        ("What does JSON.stringify(value) do?", "Serializes a JavaScript value to JSON text", "Parses JSON text into an object", "Clones DOM nodes", "Validates TypeScript types", "easy"),
+        ("What does const {name} = person do?", "Destructures the name property", "Deletes the name property", "Renames the object", "Serializes person", "easy"),
+        ("What does [...items] create for an array?", "A shallow copy", "A deep copy of every nested object", "A sorted array", "An immutable tuple", "medium"),
+        ("What is a closure?", "A function retaining access to its lexical scope", "A closed browser tab", "A class constructor only", "A rejected Promise", "medium"),
+        ("What is a common ES module named export syntax?", "export const value = 1", "module value = 1", "include value", "public value = 1", "easy"),
+        ("What does the ?? operator do?", "Uses the right side when the left side is null or undefined", "Uses the right side for every falsy value", "Compares object identities", "Creates a Promise", "medium"),
+        ("What does React render when a component returns null?", "No UI for that component", "The text 'null'", "An empty div", "A loading spinner", "easy"),
+    ],
+    "SQL": [
+        ("Which clause selects columns and expressions to return?", "SELECT", "WHERE", "GROUP BY", "ORDER BY", "easy"),
+        ("Which clause filters rows before grouping?", "WHERE", "HAVING", "LIMIT", "JOIN", "easy"),
+        ("What does an INNER JOIN return?", "Rows with matching join keys in both inputs", "Every row from the left input", "Only unmatched rows", "A Cartesian product in all cases", "easy"),
+        ("What does a primary key guarantee?", "A unique, non-null row identifier", "Rows are automatically encrypted", "Every column is indexed", "A table has one row", "easy"),
+        ("What does a foreign key enforce?", "A relationship to a referenced key", "A specific sort order", "A column's display format", "A unique value in every column", "easy"),
+        ("What is GROUP BY used for?", "Grouping rows for aggregate calculations", "Sorting rows alphabetically", "Filtering individual rows", "Renaming a table", "easy"),
+        ("Which clause filters groups after aggregation?", "HAVING", "WHERE", "FROM", "OFFSET", "medium"),
+        ("What does COUNT(*) count?", "Rows in the selected group or result", "Only non-null values in one named column", "Distinct tables", "Indexes", "easy"),
+        ("How should SQL test whether a value is missing?", "IS NULL", "= NULL", "EQUALS NULL", "IN NULL", "easy"),
+        ("What is a common purpose of a database index?", "Speed up some lookups at the cost of storage and write work", "Guarantee all queries are faster", "Replace primary keys", "Encrypt table contents", "medium"),
+        ("What does a transaction provide?", "A unit of work with defined commit or rollback behavior", "A permanent query cache", "An automatic backup", "A table alias", "easy"),
+        ("What does COMMIT do?", "Makes the current transaction's changes durable", "Cancels the current transaction", "Deletes the database", "Creates a savepoint only", "easy"),
+        ("What does ROLLBACK do?", "Undoes uncommitted changes in the transaction", "Commits all changes", "Rebuilds indexes", "Exports query results", "easy"),
+        ("What does a LEFT JOIN preserve?", "All rows from the left table and matching right rows", "Only rows from the right table", "Only matching rows", "All combinations of both tables", "medium"),
+        ("What does a UNIQUE constraint enforce?", "No duplicate values for the constrained key", "No null values in every database", "A fixed row order", "Automatic encryption", "easy"),
+        ("What is a goal of normalization?", "Reduce avoidable duplication and update anomalies", "Make every query use a full scan", "Store all data in one column", "Remove all relationships", "medium"),
+        ("What is the safest common defense against SQL injection?", "Use parameterized queries", "Concatenate escaped user input manually", "Hide the query text", "Disable database logs", "medium"),
+        ("Which clause sorts query results?", "ORDER BY", "GROUP BY", "WHERE", "HAVING", "easy"),
+        ("What does UPDATE do?", "Changes values in existing rows", "Adds a new table", "Returns only metadata", "Removes an index", "easy"),
+        ("What does DELETE FROM table WHERE condition do?", "Removes rows matching the condition", "Drops the table schema", "Changes matching rows", "Creates a backup", "easy"),
+    ],
+}
+
+TECHNICAL_SKILL_TOPICS = {
+    "python": "Python",
+    "fastapi": "Python",
+    "java": "Java",
+    "javascript": "JavaScript/React",
+    "react": "JavaScript/React",
+    "typescript": "JavaScript/React",
+    "html": "JavaScript/React",
+    "css": "JavaScript/React",
+    "sql": "SQL",
+    "postgresql": "SQL",
+    "docker": None,
+    "aws": None,
+}
+
+
+def assessment_topic_for_skill(skill: str) -> str | None:
+    lowered = skill.lower()
+    if lowered in {topic.lower() for topic in ASSESSMENT_QUESTION_BANK}:
+        return next(topic for topic in ASSESSMENT_QUESTION_BANK if topic.lower() == lowered)
+    return TECHNICAL_SKILL_TOPICS.get(lowered)
+
+
+def balanced_question_sample(questions: list[sqlite3.Row], count: int) -> list[sqlite3.Row]:
+    grouped = {
+        level: [question for question in questions if question["difficulty"].lower() == level.lower()]
+        for level in ("Easy", "Medium", "Hard")
+    }
+    rng = random.SystemRandom()
+    for level_questions in grouped.values():
+        rng.shuffle(level_questions)
+    selected: list[sqlite3.Row] = []
+    while len(selected) < count:
+        progressed = False
+        for level in ("Easy", "Medium", "Hard"):
+            if grouped[level] and len(selected) < count:
+                selected.append(grouped[level].pop())
+                progressed = True
+        if not progressed:
+            break
+    return selected
+
+
+def seed_assessment_questions(db: sqlite3.Connection) -> None:
+    for technology, questions in ASSESSMENT_QUESTION_BANK.items():
+        for question, correct, *wrong_and_difficulty in questions:
+            difficulty = wrong_and_difficulty.pop()
+            options = [correct, *wrong_and_difficulty]
+            random.SystemRandom().shuffle(options)
+            db.execute(
+                """INSERT OR IGNORE INTO technical_questions
+                (technology, question, options_json, correct_index, difficulty, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (technology, question, json.dumps(options), options.index(correct), difficulty, now()),
+            )
+
+
+def initialize_database() -> None:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    with connect() as db:
+        db.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('candidate', 'recruiter', 'admin')),
+                profile_json TEXT NOT NULL DEFAULT '{}',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recruiter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                title TEXT NOT NULL,
+                company TEXT NOT NULL,
+                description TEXT NOT NULL,
+                location TEXT NOT NULL,
+                experience TEXT NOT NULL,
+                job_type TEXT NOT NULL,
+                salary TEXT NOT NULL DEFAULT '',
+                skills_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'Open' CHECK(status IN ('Open', 'Closed')),
+                assessment_question_count INTEGER NOT NULL DEFAULT 20,
+                allow_detailed_results INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS resumes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id INTEGER NOT NULL UNIQUE REFERENCES users(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                extracted_text TEXT NOT NULL DEFAULT '',
+                parsed_profile_json TEXT NOT NULL DEFAULT '{}',
+                processing_status TEXT NOT NULL,
+                processing_error TEXT NOT NULL DEFAULT '',
+                uploaded_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS applications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                candidate_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL,
+                status TEXT NOT NULL DEFAULT 'Applied',
+                match_percentage INTEGER,
+                matched_skills_json TEXT NOT NULL DEFAULT '[]',
+                missing_skills_json TEXT NOT NULL DEFAULT '[]',
+                internal_notes TEXT NOT NULL DEFAULT '',
+                applied_at TEXT NOT NULL,
+                UNIQUE(candidate_id, job_id)
+            );
+            CREATE TABLE IF NOT EXISTS application_status_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+                status TEXT NOT NULL,
+                actor_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                actor_role TEXT NOT NULL,
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                message TEXT NOT NULL,
+                related_application_id INTEGER REFERENCES applications(id) ON DELETE CASCADE,
+                related_assessment_id INTEGER REFERENCES assessments(id) ON DELETE SET NULL,
+                action_url TEXT NOT NULL DEFAULT '',
+                is_read INTEGER NOT NULL DEFAULT 0,
+                email_delivery_status TEXT NOT NULL DEFAULT 'Not Sent',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS question_bank_imports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                recruiter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                storage_path TEXT NOT NULL,
+                upload_status TEXT NOT NULL CHECK(upload_status IN ('Preview', 'Confirmed', 'Cancelled', 'Failed')),
+                total_extracted INTEGER NOT NULL DEFAULT 0,
+                valid_count INTEGER NOT NULL DEFAULT 0,
+                invalid_count INTEGER NOT NULL DEFAULT 0,
+                preview_json TEXT NOT NULL DEFAULT '[]',
+                error_details_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                confirmed_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS job_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                owner_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                recruiter_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+                technology TEXT NOT NULL,
+                question TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                correct_index INTEGER NOT NULL CHECK(correct_index BETWEEN 0 AND 3),
+                difficulty TEXT NOT NULL CHECK(difficulty IN ('Easy', 'Medium', 'Hard')),
+                active INTEGER NOT NULL DEFAULT 1,
+                source_type TEXT NOT NULL DEFAULT 'manual' CHECK(source_type IN ('manual', 'pdf_import')),
+                source_import_id INTEGER REFERENCES question_bank_imports(id) ON DELETE SET NULL,
+                explanation TEXT NOT NULL DEFAULT '',
+                learning_resource_url TEXT NOT NULL DEFAULT '',
+                subtopic TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(job_id, question)
+            );
+            CREATE TABLE IF NOT EXISTS technical_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                technology TEXT NOT NULL,
+                question TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                correct_index INTEGER NOT NULL CHECK(correct_index BETWEEN 0 AND 3),
+                difficulty TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                UNIQUE(technology, question)
+            );
+            CREATE TABLE IF NOT EXISTS assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL UNIQUE REFERENCES applications(id) ON DELETE CASCADE,
+                candidate_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                technology TEXT,
+                token_hash TEXT UNIQUE,
+                status TEXT NOT NULL CHECK(status IN ('Not Sent', 'Sent', 'Started', 'Completed', 'Expired', 'Manual Topic Required', 'Pending Recruiter Decision')),
+                match_percentage INTEGER NOT NULL,
+                starts_at TEXT,
+                expires_at TEXT,
+                submitted_at TEXT,
+                score INTEGER,
+                total_questions INTEGER NOT NULL DEFAULT 20,
+                assessment_name TEXT NOT NULL DEFAULT 'Round 1: Technical MCQ Test',
+                assessment_round TEXT NOT NULL DEFAULT 'Round 1',
+                pass_percentage REAL NOT NULL DEFAULT 75,
+                score_percentage REAL,
+                correct_answer_count INTEGER,
+                incorrect_answer_count INTEGER,
+                result TEXT CHECK(result IS NULL OR result IN ('Passed', 'Failed')),
+                result_processed_at TEXT,
+                time_taken_seconds INTEGER,
+                duration_minutes INTEGER NOT NULL,
+                email_sent_at TEXT,
+                question_topics_json TEXT NOT NULL DEFAULT '[]',
+                question_topic_weights_json TEXT NOT NULL DEFAULT '{}',
+                selection_reasoning TEXT NOT NULL DEFAULT '',
+                proctoring_required INTEGER NOT NULL DEFAULT 1,
+                proctoring_consent_at TEXT,
+                camera_permission_granted_at TEXT,
+                proctoring_started_at TEXT,
+                proctoring_warning_count INTEGER NOT NULL DEFAULT 0,
+                proctoring_flagged_at TEXT,
+                detailed_results_visible INTEGER NOT NULL DEFAULT 1,
+                recruiter_decision TEXT CHECK(recruiter_decision IS NULL OR recruiter_decision IN ('Passed', 'Failed')),
+                recruiter_decision_at TEXT,
+                recruiter_decision_by INTEGER REFERENCES users(id),
+                recruiter_decision_notes TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS assessment_questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assessment_id INTEGER NOT NULL REFERENCES assessments(id) ON DELETE CASCADE,
+                question_id INTEGER NOT NULL REFERENCES technical_questions(id),
+                question_order INTEGER NOT NULL,
+                question_snapshot TEXT NOT NULL,
+                options_snapshot TEXT NOT NULL,
+                correct_index INTEGER NOT NULL CHECK(correct_index BETWEEN 0 AND 3),
+                selected_answer INTEGER,
+                is_correct INTEGER,
+                answered_at TEXT,
+                technology TEXT,
+                difficulty TEXT,
+                explanation TEXT NOT NULL DEFAULT '',
+                learning_resource_url TEXT NOT NULL DEFAULT '',
+                subtopic TEXT NOT NULL DEFAULT '',
+                UNIQUE(assessment_id, question_order),
+                UNIQUE(assessment_id, question_id)
+            );
+            CREATE TABLE IF NOT EXISTS assessment_proctoring_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assessment_id INTEGER NOT NULL REFERENCES assessments(id) ON DELETE CASCADE,
+                event_type TEXT NOT NULL CHECK(event_type IN (
+                    'camera_granted', 'camera_denied', 'assessment_started',
+                    'face_missing', 'face_returned', 'multiple_faces',
+                    'single_face_restored', 'tab_hidden', 'window_blur',
+                    'window_focus', 'camera_stopped'
+                )),
+                severity TEXT NOT NULL CHECK(severity IN ('info', 'warning')),
+                duration_seconds INTEGER,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS interviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+                recruiter_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                scheduled_at TEXT NOT NULL,
+                teams_url TEXT NOT NULL DEFAULT '',
+                meeting_platform TEXT NOT NULL DEFAULT 'Microsoft Teams',
+                meeting_url TEXT NOT NULL DEFAULT '',
+                duration_minutes INTEGER NOT NULL DEFAULT 60,
+                timezone TEXT NOT NULL DEFAULT 'UTC',
+                recruiter_message TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'Scheduled'
+                    CHECK(status IN ('Scheduled', 'Rescheduled', 'Cancelled', 'Completed')),
+                invitation_sent_at TEXT,
+                candidate_viewed_at TEXT,
+                code TEXT NOT NULL DEFAULT '',
+                language TEXT NOT NULL DEFAULT 'python',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS candidate_ai_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL UNIQUE REFERENCES applications(id) ON DELETE CASCADE,
+                recommendation TEXT NOT NULL CHECK(recommendation IN ('Strong Hire', 'Recommended', 'Borderline', 'Not Recommended')),
+                summary TEXT NOT NULL,
+                strengths_json TEXT NOT NULL DEFAULT '[]',
+                risks_json TEXT NOT NULL DEFAULT '[]',
+                interview_questions_json TEXT NOT NULL DEFAULT '[]',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS assessment_recordings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assessment_id INTEGER NOT NULL REFERENCES assessments(id) ON DELETE CASCADE,
+                application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+                candidate_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                cloudinary_public_id TEXT,
+                cloudinary_asset_id TEXT,
+                cloudinary_resource_type TEXT DEFAULT 'video',
+                secure_url TEXT,
+                duration_seconds INTEGER DEFAULT 0,
+                file_size_bytes INTEGER DEFAULT 0,
+                format TEXT DEFAULT 'webm',
+                recording_status TEXT NOT NULL DEFAULT 'Pending' CHECK(recording_status IN ('Pending', 'Uploading', 'Uploaded', 'Failed', 'Partial')),
+                upload_error TEXT,
+                started_at TEXT,
+                ended_at TEXT,
+                uploaded_at TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS recording_access_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                recording_id INTEGER NOT NULL REFERENCES assessment_recordings(id) ON DELETE CASCADE,
+                admin_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                accessed_at TEXT NOT NULL,
+                ip_address TEXT,
+                user_agent TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_assessment_recordings_assessment ON assessment_recordings(assessment_id);
+            CREATE INDEX IF NOT EXISTS idx_assessment_recordings_candidate ON assessment_recordings(candidate_id);
+            CREATE INDEX IF NOT EXISTS idx_assessment_recordings_app ON assessment_recordings(application_id);
+            CREATE INDEX IF NOT EXISTS idx_recording_access_logs_recording ON recording_access_logs(recording_id);
+            """
+        )
+        user_columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "active" not in user_columns:
+            db.execute("ALTER TABLE users ADD COLUMN active INTEGER NOT NULL DEFAULT 1")
+        job_columns = {row["name"] for row in db.execute("PRAGMA table_info(jobs)")}
+        for column, definition in (
+            ("assessment_question_count", "INTEGER NOT NULL DEFAULT 20"),
+            ("allow_detailed_results", "INTEGER NOT NULL DEFAULT 1"),
+        ):
+            if column not in job_columns:
+                db.execute(f"ALTER TABLE jobs ADD COLUMN {column} {definition}")
+        application_columns = {row["name"] for row in db.execute("PRAGMA table_info(applications)")}
+        if "match_percentage" not in application_columns:
+            db.execute("ALTER TABLE applications ADD COLUMN match_percentage INTEGER")
+        for column, definition in (
+            ("matched_skills_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("missing_skills_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("internal_notes", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in application_columns:
+                db.execute(f"ALTER TABLE applications ADD COLUMN {column} {definition}")
+        job_question_columns = {row["name"] for row in db.execute("PRAGMA table_info(job_questions)")}
+        for column, definition in (
+            ("recruiter_id", "INTEGER REFERENCES users(id) ON DELETE CASCADE"),
+            ("source_type", "TEXT NOT NULL DEFAULT 'manual'"),
+            ("source_import_id", "INTEGER REFERENCES question_bank_imports(id) ON DELETE SET NULL"),
+            ("explanation", "TEXT NOT NULL DEFAULT ''"),
+            ("learning_resource_url", "TEXT NOT NULL DEFAULT ''"),
+            ("subtopic", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in job_question_columns:
+                db.execute(f"ALTER TABLE job_questions ADD COLUMN {column} {definition}")
+        db.execute(
+            """UPDATE job_questions SET recruiter_id = owner_id
+            WHERE recruiter_id IS NULL"""
+        )
+        assessments_row = db.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='assessments'").fetchone()
+        if assessments_row and "Pending Recruiter Decision" not in assessments_row[0]:
+            cols = [r[1] for r in db.execute("PRAGMA table_info(assessments)").fetchall()]
+            cols_joined = ", ".join(f'"{c}"' for c in cols)
+            db.execute("PRAGMA foreign_keys = OFF")
+            db.execute("""
+                CREATE TABLE assessments_new (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL UNIQUE REFERENCES applications(id) ON DELETE CASCADE,
+                    candidate_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                    technology TEXT,
+                    token_hash TEXT UNIQUE,
+                    status TEXT NOT NULL CHECK(status IN ('Not Sent', 'Sent', 'Started', 'Completed', 'Expired', 'Manual Topic Required', 'Pending Recruiter Decision')),
+                    match_percentage INTEGER NOT NULL,
+                    starts_at TEXT,
+                    expires_at TEXT,
+                    submitted_at TEXT,
+                    score INTEGER,
+                    total_questions INTEGER NOT NULL DEFAULT 20,
+                    assessment_name TEXT NOT NULL DEFAULT 'Round 1: Technical MCQ Test',
+                    assessment_round TEXT NOT NULL DEFAULT 'Round 1',
+                    pass_percentage REAL NOT NULL DEFAULT 75,
+                    score_percentage REAL,
+                    correct_answer_count INTEGER,
+                    incorrect_answer_count INTEGER,
+                    result TEXT,
+                    result_processed_at TEXT,
+                    time_taken_seconds INTEGER,
+                    duration_minutes INTEGER NOT NULL,
+                    email_sent_at TEXT,
+                    question_topics_json TEXT NOT NULL DEFAULT '[]',
+                    question_topic_weights_json TEXT NOT NULL DEFAULT '{}',
+                    selection_reasoning TEXT NOT NULL DEFAULT '',
+                    proctoring_required INTEGER NOT NULL DEFAULT 1,
+                    proctoring_consent_at TEXT,
+                    camera_permission_granted_at TEXT,
+                    proctoring_started_at TEXT,
+                    proctoring_warning_count INTEGER NOT NULL DEFAULT 0,
+                    proctoring_flagged_at TEXT,
+                    detailed_results_visible INTEGER NOT NULL DEFAULT 1,
+                    recording_required INTEGER NOT NULL DEFAULT 1,
+                    recording_consent_given_at TEXT,
+                    recording_consent_version TEXT,
+                    recording_status TEXT DEFAULT 'Pending',
+                    recording_failure_reason TEXT,
+                    recording_available_at TEXT,
+                    submitted_token_hash TEXT,
+                    recruiter_decision TEXT CHECK(recruiter_decision IS NULL OR recruiter_decision IN ('Passed', 'Failed')),
+                    recruiter_decision_at TEXT,
+                    recruiter_decision_by INTEGER REFERENCES users(id),
+                    recruiter_decision_notes TEXT,
+                    created_at TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            db.execute(f"INSERT INTO assessments_new ({cols_joined}) SELECT {cols_joined} FROM assessments")
+            db.execute("DROP TABLE assessments")
+            db.execute("ALTER TABLE assessments_new RENAME TO assessments")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_candidate_job ON assessments(candidate_id, job_id)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_token_hash ON assessments(token_hash)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_proctoring_flagged ON assessments(proctoring_flagged_at, starts_at)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_status ON assessments(status, submitted_at)")
+            db.execute("PRAGMA foreign_keys = ON")
+        assessment_columns = {row["name"] for row in db.execute("PRAGMA table_info(assessments)")}
+        for column, definition in (
+            ("question_topics_json", "TEXT NOT NULL DEFAULT '[]'"),
+            ("question_topic_weights_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("selection_reasoning", "TEXT NOT NULL DEFAULT ''"),
+            ("assessment_name", "TEXT NOT NULL DEFAULT 'Round 1: Technical MCQ Test'"),
+            ("assessment_round", "TEXT NOT NULL DEFAULT 'Round 1'"),
+            ("pass_percentage", "REAL NOT NULL DEFAULT 75"),
+            ("score_percentage", "REAL"),
+            ("correct_answer_count", "INTEGER"),
+            ("incorrect_answer_count", "INTEGER"),
+            ("result", "TEXT CHECK(result IS NULL OR result IN ('Passed', 'Failed'))"),
+            ("result_processed_at", "TEXT"),
+            ("time_taken_seconds", "INTEGER"),
+            ("proctoring_required", "INTEGER NOT NULL DEFAULT 1"),
+            ("proctoring_consent_at", "TEXT"),
+            ("camera_permission_granted_at", "TEXT"),
+            ("proctoring_started_at", "TEXT"),
+            ("proctoring_warning_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("proctoring_flagged_at", "TEXT"),
+            ("detailed_results_visible", "INTEGER NOT NULL DEFAULT 1"),
+            ("recording_required", "INTEGER NOT NULL DEFAULT 1"),
+            ("recording_consent_given_at", "TEXT"),
+            ("recording_consent_version", "TEXT"),
+            ("recording_status", "TEXT DEFAULT 'Pending'"),
+            ("recording_failure_reason", "TEXT"),
+            ("recording_available_at", "TEXT"),
+            ("submitted_token_hash", "TEXT"),
+            ("recruiter_decision", "TEXT CHECK(recruiter_decision IS NULL OR recruiter_decision IN ('Passed', 'Failed'))"),
+            ("recruiter_decision_at", "TEXT"),
+            ("recruiter_decision_by", "INTEGER REFERENCES users(id)"),
+            ("recruiter_decision_notes", "TEXT"),
+        ):
+            if column not in assessment_columns:
+                db.execute(f"ALTER TABLE assessments ADD COLUMN {column} {definition}")
+        db.execute(
+            """UPDATE assessments SET recruiter_decision = result
+            WHERE status = 'Completed' AND recruiter_decision IS NULL AND result IS NOT NULL"""
+        )
+        db.execute(
+            """UPDATE assessments SET proctoring_required = 0
+            WHERE status = 'Started' AND starts_at IS NOT NULL
+            AND proctoring_consent_at IS NULL AND proctoring_started_at IS NULL"""
+        )
+        assessment_question_columns = {row["name"] for row in db.execute("PRAGMA table_info(assessment_questions)")}
+        for column, definition in (
+            ("technology", "TEXT"),
+            ("difficulty", "TEXT"),
+            ("explanation", "TEXT NOT NULL DEFAULT ''"),
+            ("learning_resource_url", "TEXT NOT NULL DEFAULT ''"),
+            ("subtopic", "TEXT NOT NULL DEFAULT ''"),
+        ):
+            if column not in assessment_question_columns:
+                db.execute(f"ALTER TABLE assessment_questions ADD COLUMN {column} {definition}")
+        interview_columns = {row["name"] for row in db.execute("PRAGMA table_info(interviews)")}
+        for column, definition in (
+            ("meeting_platform", "TEXT NOT NULL DEFAULT 'Microsoft Teams'"),
+            ("meeting_url", "TEXT NOT NULL DEFAULT ''"),
+            ("duration_minutes", "INTEGER NOT NULL DEFAULT 60"),
+            ("timezone", "TEXT NOT NULL DEFAULT 'UTC'"),
+            ("recruiter_message", "TEXT NOT NULL DEFAULT ''"),
+            ("status", "TEXT NOT NULL DEFAULT 'Scheduled' CHECK(status IN ('Scheduled', 'Rescheduled', 'Cancelled', 'Completed'))"),
+            ("invitation_sent_at", "TEXT"),
+            ("candidate_viewed_at", "TEXT"),
+        ):
+            if column not in interview_columns:
+                db.execute(f"ALTER TABLE interviews ADD COLUMN {column} {definition}")
+        db.execute(
+            """UPDATE interviews SET meeting_url = teams_url
+            WHERE meeting_url = '' AND teams_url != ''"""
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_interviews_application_schedule ON interviews(application_id, scheduled_at)"
+        )
+        db.execute(
+            """INSERT INTO application_status_history
+            (application_id, status, actor_role, created_at)
+            SELECT a.id, a.status, 'system', a.applied_at FROM applications a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM application_status_history h WHERE h.application_id = a.id
+            )"""
+        )
+        db.execute(
+            """UPDATE assessments SET
+            assessment_name = ?, assessment_round = 'Round 1',
+            score_percentage = ROUND(score * 100.0 / NULLIF(total_questions, 0), 2),
+            correct_answer_count = score,
+            incorrect_answer_count = total_questions - score,
+            result = CASE
+                WHEN score * 100.0 / NULLIF(total_questions, 0) >= pass_percentage THEN 'Passed'
+                ELSE 'Failed'
+            END,
+            result_processed_at = COALESCE(result_processed_at, submitted_at),
+            time_taken_seconds = CASE
+                WHEN starts_at IS NOT NULL AND submitted_at IS NOT NULL
+                THEN MAX(0, CAST((julianday(submitted_at) - julianday(starts_at)) * 86400 AS INTEGER))
+                ELSE time_taken_seconds
+            END
+            WHERE status = 'Completed' AND score IS NOT NULL AND result IS NULL""",
+            (ROUND1_ASSESSMENT_NAME,),
+        )
+        migrated_results = db.execute(
+            """SELECT x.application_id, a.status, x.recruiter_decision AS result, x.score_percentage,
+            x.correct_answer_count, x.total_questions, x.pass_percentage
+            FROM assessments x JOIN applications a ON a.id = x.application_id
+            WHERE x.status = 'Completed' AND x.recruiter_decision IS NOT NULL
+            AND a.status = 'Assessment Completed'"""
+        ).fetchall()
+        for result_row in migrated_results:
+            db.execute(
+                "UPDATE applications SET status = ? WHERE id = ?",
+                (f"Round 1 {result_row['result']}", result_row["application_id"]),
+            )
+            latest = db.execute(
+                """SELECT status FROM application_status_history
+                WHERE application_id = ? ORDER BY created_at DESC, id DESC LIMIT 1""",
+                (result_row["application_id"],),
+            ).fetchone()
+            round_status = f"Round 1 {result_row['result']}"
+            if not latest or latest["status"] != round_status:
+                record_application_status(
+                    db, result_row["application_id"], round_status,
+                    {"id": None, "role": "system"},
+                    f"Round 1 score: {result_row['score_percentage']:g}% "
+                    f"({result_row['correct_answer_count']}/{result_row['total_questions']} correct); "
+                    f"passing score: {result_row['pass_percentage']:g}%.",
+                )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_application_history_application ON application_status_history(application_id, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_notifications_user_read ON notifications(user_id, is_read, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_job_questions_job_topic_active ON job_questions(job_id, technology, active)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_question_imports_job_created ON question_bank_imports(job_id, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_candidate_job ON assessments(candidate_id, job_id)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_token_hash ON assessments(token_hash)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_assessment_questions_assessment ON assessment_questions(assessment_id, question_order)")
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_proctoring_events_assessment_time ON assessment_proctoring_events(assessment_id, created_at, id)"
+        )
+        db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_assessments_proctoring_flagged ON assessments(proctoring_flagged_at, starts_at)"
+        )
+        db.execute("CREATE INDEX IF NOT EXISTS idx_candidate_ai_summaries_app ON candidate_ai_summaries(application_id)")
+        # Additional performance indexes
+        db.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_applications_candidate ON applications(candidate_id, applied_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON jobs(status, created_at)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_recruiter ON jobs(recruiter_id, status)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_users_email ON users(email)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_assessments_status ON assessments(status, submitted_at)")
+        db.execute(
+            """INSERT INTO application_status_history
+            (application_id, status, actor_role, created_at)
+            SELECT a.id, a.status, 'system', a.applied_at FROM applications a
+            WHERE NOT EXISTS (
+                SELECT 1 FROM application_status_history h WHERE h.application_id = a.id
+            )"""
+        )
+        enable_demo = os.environ.get("SKILLSPHERE_ENABLE_DEMO", "true").lower() not in {"false", "0", "no"}
+
+        # Seed configured production admin if specified
+        admin_email = os.environ.get("SKILLSPHERE_ADMIN_EMAIL")
+        admin_password = os.environ.get("SKILLSPHERE_ADMIN_PASSWORD")
+        if admin_email and admin_password and not db.execute(
+            "SELECT 1 FROM users WHERE email = ?", (admin_email,)
+        ).fetchone():
+            db.execute(
+                "INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, 'admin', ?)",
+                ("SkillSphere Admin", admin_email, password_hash(admin_password), now()),
+            )
+
+        if not enable_demo:
+            return
+
+        # Seed demo users if they do not exist
+        if not db.execute("SELECT 1 FROM users WHERE email = ?", ("candidate@skillsphere.dev",)).fetchone():
+            users = [
+                ("Alex Morgan", "candidate@skillsphere.dev", password_hash("Demo123!"), "candidate", '{"location":"Brooklyn, NY"}', now()),
+                ("Jamie Rivera", "recruiter@skillsphere.dev", password_hash("Demo123!"), "recruiter", '{"company":"Northstar"}', now()),
+                ("Avery Chen", "admin@skillsphere.dev", password_hash("Demo123!"), "admin", "{}", now()),
+            ]
+            db.executemany(
+                "INSERT OR IGNORE INTO users (name, email, password_hash, role, profile_json, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                users,
+            )
+
+        # Seed demo jobs if none exist
+        if not db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]:
+            recruiter_row = db.execute("SELECT id FROM users WHERE email = ?", ("recruiter@skillsphere.dev",)).fetchone()
+            if recruiter_row:
+                recruiter_id = recruiter_row["id"]
+                jobs = [
+                    ("Product Designer", "Northstar", "Shape clear, human-centered product experiences from early discovery through thoughtful delivery. Partner with product and engineering to make complex workflows feel effortless.", "New York, NY", "2–4 years", "Full-time", "$95k – $125k", ["Figma", "UX research", "Prototyping", "Design systems"]),
+                    ("Frontend Engineer", "Layer", "Help us make useful tools feel delightful. Build accessible, polished interfaces with a product-minded team that cares about performance, collaboration, and the details.", "Remote · US", "3–5 years", "Remote", "$110k – $145k", ["React", "TypeScript", "CSS", "Accessibility"]),
+                    ("Data Analyst", "Goodkind", "Turn questions into insights that help our teams and customers make better decisions. Work across product analytics, experimentation, and clear data storytelling.", "Austin, TX", "1–3 years", "Full-time", "$82k – $105k", ["SQL", "Python", "Tableau", "Analytics"]),
+                    ("People Operations Partner", "Fieldwork", "Create warm, thoughtful experiences across the employee journey. Help build scalable people programs in a growing, remote-friendly company.", "Remote · US", "3–6 years", "Remote", "$88k – $118k", ["People ops", "HR", "Communication", "Operations"]),
+                    ("Marketing Associate", "Sunday Studio", "Bring a curious, creative perspective to campaigns that help more people discover our work. You'll collaborate across content, community, and growth.", "Brooklyn, NY", "1–2 years", "Full-time", "$65k – $82k", ["Content", "Social media", "Writing", "Marketing"]),
+                    ("Backend Engineer", "Northstar", "Build dependable APIs and thoughtfully designed services for a growing product. We value ownership, clear communication, and pragmatic engineering.", "New York, NY", "4–6 years", "Contract", "$125k – $160k", ["Python", "FastAPI", "PostgreSQL", "APIs"]),
+                ]
+                seeded_at = now()
+                db.executemany(
+                    """INSERT INTO jobs
+                    (recruiter_id, title, company, description, location, experience, job_type, salary, skills_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [(recruiter_id, *job[:7], json.dumps(job[7]), seeded_at) for job in jobs],
+                )
+
+
+def public_job(row: sqlite3.Row) -> dict[str, Any]:
+    job = dict(row)
+    try:
+        job["skills"] = json.loads(job.pop("skills_json", "[]") or "[]")
+    except (json.JSONDecodeError, KeyError, TypeError):
+        job["skills"] = []
+    return job
+
+
+def public_resume(row: sqlite3.Row) -> dict[str, Any]:
+    resume = dict(row)
+    resume.pop("storage_path", None)
+    resume.pop("extracted_text", None)
+    try:
+        resume["parsed_profile"] = json.loads(resume.pop("parsed_profile_json", "{}") or "{}")
+    except (json.JSONDecodeError, KeyError, TypeError):
+        resume["parsed_profile"] = {}
+    return resume
+
+
+def public_application(row: sqlite3.Row) -> dict[str, Any]:
+    return dict(row)
+
+
+def detect_profile(text: str) -> dict[str, Any]:
+    email = re.search(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", text, re.I)
+    phone = re.search(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)", text)
+    name = None
+    for line in (line.strip() for line in text.splitlines()):
+        if line and len(line) < 70 and not re.search(r"[@\d]", line) and len(line.split()) <= 5:
+            name = line
+            break
+    known_skills = (
+        # Languages
+        "python", "javascript", "typescript", "java", "kotlin", "swift",
+        "go", "golang", "rust", "c++", "c#", "php", "ruby", "scala", "dart",
+        # Frontend
+        "react", "next.js", "nextjs", "vue", "vue.js", "nuxt", "angular",
+        "svelte", "html", "css", "sass", "tailwind", "webpack", "vite",
+        # Backend / APIs
+        "fastapi", "django", "flask", "node.js", "nodejs", "express",
+        "spring boot", "rails", "graphql", "rest", "grpc",
+        # Databases
+        "sql", "postgresql", "postgres", "mysql", "mongodb", "redis",
+        "sqlite", "elasticsearch", "dynamodb", "firebase",
+        # Cloud / DevOps
+        "aws", "azure", "google cloud", "gcp", "docker", "kubernetes",
+        "terraform", "ansible", "ci/cd", "github actions", "jenkins",
+        "linux", "bash", "shell scripting",
+        # Data / ML / AI
+        "machine learning", "deep learning", "pytorch", "tensorflow",
+        "scikit-learn", "pandas", "numpy", "data analysis", "data science",
+        "llm", "nlp", "computer vision", "tableau", "power bi", "excel",
+        "spark", "airflow", "dbt",
+        # Design / Product
+        "figma", "sketch", "ux research", "product design", "prototyping",
+        "design systems", "user research", "wireframing", "adobe xd",
+        # Soft / management
+        "project management", "agile", "scrum", "communication",
+        "leadership", "product management", "jira",
+    )
+    skills = [
+        skill.title()
+        for skill in known_skills
+        if re.search(rf"(?<![a-z0-9]){re.escape(skill)}(?![a-z0-9])", text, re.I)
+    ]
+    return {
+        "name": name or "",
+        "email": email.group(0) if email else "",
+        "phone": phone.group(0).strip() if phone else "",
+        "skills": skills,
+        "summary": "",
+    }
+
+
+def calculate_match(
+    job: sqlite3.Row | dict[str, Any],
+    resume: sqlite3.Row | dict[str, Any],
+    saved_profile_json: str,
+) -> dict[str, Any]:
+    try:
+        required = json.loads(job["skills_json"]) if job["skills_json"] else []
+    except (json.JSONDecodeError, TypeError):
+        required = []
+    try:
+        resume_profile = json.loads(resume["parsed_profile_json"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        resume_profile = {}
+    try:
+        saved_profile = json.loads(saved_profile_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        saved_profile = {}
+    extracted_skills = resume_profile.get("skills", [])
+    saved_skills = saved_profile.get("skills", [])
+    if not isinstance(extracted_skills, list) or not all(isinstance(skill, str) for skill in extracted_skills):
+        raise HTTPException(status_code=500, detail="The saved resume profile is invalid")
+    if not isinstance(saved_skills, list) or not all(isinstance(skill, str) for skill in saved_skills):
+        raise HTTPException(status_code=422, detail="Profile skills must be a list of text values")
+    profile_skills = " ".join([*extracted_skills, *saved_skills])
+    text = f"{resume['extracted_text']} {profile_skills}"
+    matched = [
+        skill for skill in required
+        if re.search(rf"(?<![a-z0-9]){re.escape(skill.strip())}(?![a-z0-9])", text, re.I)
+    ]
+    missing = [skill for skill in required if skill not in matched]
+    score = round(len(matched) / len(required) * 100) if required else 0
+    if not matched:
+        recommendation = "Add relevant experience or skills to your profile to strengthen your application."
+    elif missing:
+        recommendation = f"Highlight your experience with {', '.join(missing)} if it reflects your background."
+    else:
+        recommendation = "Your resume mentions every listed skill. Make sure your experience shows how you use them."
+    return {
+        "job_id": job["id"],
+        "match_percentage": score,
+        "matched_skills": matched,
+        "missing_skills": missing,
+        "recommendation": recommendation,
+    }
+
+
+def primary_assessment_topic(
+    job: sqlite3.Row | dict[str, Any],
+    resume: sqlite3.Row | dict[str, Any],
+    saved_profile_json: str,
+) -> str | None:
+    resume_profile = json.loads(resume["parsed_profile_json"] or "{}")
+    saved_profile = json.loads(saved_profile_json or "{}")
+    profile_skills = [
+        *resume_profile.get("skills", []),
+        *saved_profile.get("skills", []),
+        *detect_profile(resume["extracted_text"])["skills"],
+    ]
+    evidence = f"{resume['extracted_text']} {' '.join(profile_skills)}".lower()
+    required = {skill.lower() for skill in json.loads(job["skills_json"])}
+    detected: list[tuple[str, bool, int]] = []
+    for skill, topic in TECHNICAL_SKILL_TOPICS.items():
+        pattern = rf"(?<![a-z0-9]){re.escape(skill)}(?![a-z0-9])"
+        count = len(re.findall(pattern, evidence))
+        if not count:
+            continue
+        relevant = skill in required or (topic is not None and any(
+            assessment_topic_for_skill(required_skill) == topic for required_skill in required
+        ))
+        detected.append((skill, relevant, count))
+    if not detected:
+        return None
+    detected.sort(key=lambda item: (item[1], item[2]), reverse=True)
+    if len(detected) > 1 and detected[0][1:] == detected[1][1:]:
+        if TECHNICAL_SKILL_TOPICS[detected[0][0]] != TECHNICAL_SKILL_TOPICS[detected[1][0]]:
+            return None
+    return TECHNICAL_SKILL_TOPICS[detected[0][0]]
+
+
+def canonical_question_topic(skill: str) -> str:
+    normalized = skill.strip().casefold()
+    return (assessment_topic_for_skill(normalized) or skill.strip()).casefold()
+
+
+def relevant_question_topic_weights(
+    job: sqlite3.Row,
+    resume: sqlite3.Row,
+    saved_profile_json: str,
+    available_topics: dict[str, int],
+) -> tuple[dict[str, int], str]:
+    resume_profile = json.loads(resume["parsed_profile_json"] or "{}")
+    saved_profile = json.loads(saved_profile_json or "{}")
+    candidate_skills = [
+        *resume_profile.get("skills", []),
+        *saved_profile.get("skills", []),
+        *detect_profile(resume["extracted_text"])["skills"],
+    ]
+    required_skills = json.loads(job["skills_json"])
+    candidate_text = f"{resume['extracted_text']} {' '.join(candidate_skills)}".casefold()
+    candidate_topics = {canonical_question_topic(skill) for skill in candidate_skills if skill.strip()}
+    for topic in available_topics:
+        if re.search(rf"(?<![a-z0-9]){re.escape(topic.casefold())}(?![a-z0-9])", candidate_text):
+            candidate_topics.add(topic.casefold())
+    required_by_topic: dict[str, list[str]] = {}
+    for skill in required_skills:
+        required_by_topic.setdefault(canonical_question_topic(skill), []).append(skill)
+
+    weights: dict[str, int] = {}
+    for topic in available_topics:
+        normalized_topic = topic.casefold()
+        if normalized_topic not in candidate_topics or normalized_topic not in required_by_topic:
+            continue
+        matching_skills = required_by_topic[normalized_topic]
+        strength = 0
+        for skill in matching_skills:
+            mentions = len(re.findall(
+                rf"(?<![a-z0-9]){re.escape(skill.strip().casefold())}(?![a-z0-9])",
+                candidate_text,
+            ))
+            strength += max(1, mentions)
+        if strength:
+            weights[topic] = strength
+    if not weights:
+        return {}, "No job-question topic was found in both candidate skills and job requirements."
+    reason = (
+        "Topics were selected from active questions whose technologies match both the candidate's "
+        "resume/profile and the job's required skills; topic proportions are weighted by matching skill evidence."
+    )
+    return weights, reason
+
+
+def relevant_balanced_question_sample(
+    questions: list[sqlite3.Row],
+    topic_weights: dict[str, int],
+    count: int,
+) -> list[sqlite3.Row]:
+    groups = {
+        topic: [question for question in questions if question["technology"].casefold() == topic.casefold()]
+        for topic in topic_weights
+    }
+    active_topics = [topic for topic, group in groups.items() if group]
+    if sum(len(group) for group in groups.values()) < count or not active_topics:
+        return []
+    total_weight = sum(topic_weights[topic] for topic in active_topics)
+    desired = {topic: count * topic_weights[topic] / total_weight for topic in active_topics}
+    allocation = {topic: min(len(groups[topic]), int(desired[topic])) for topic in active_topics}
+    remaining = count - sum(allocation.values())
+    while remaining:
+        candidates = [topic for topic in active_topics if allocation[topic] < len(groups[topic])]
+        if not candidates:
+            return []
+        candidates.sort(
+            key=lambda topic: (desired[topic] - allocation[topic], topic_weights[topic]),
+            reverse=True,
+        )
+        allocation[candidates[0]] += 1
+        remaining -= 1
+    selected: list[sqlite3.Row] = []
+    for topic in active_topics:
+        selected.extend(balanced_question_sample(groups[topic], allocation[topic]))
+    random.SystemRandom().shuffle(selected)
+    return selected
+
+
+def assessment_for_match(
+    db: sqlite3.Connection,
+    application_id: int,
+    candidate_id: int,
+    job: sqlite3.Row,
+    resume: sqlite3.Row,
+    saved_profile_json: str,
+    match_percentage: int,
+) -> None:
+    if match_percentage < 70:
+        return
+    questions = db.execute(
+        """SELECT id, technology, question, options_json, correct_index, difficulty
+        FROM job_questions WHERE job_id = ? AND active = 1 ORDER BY id""",
+        (job["id"],),
+    ).fetchall()
+    available_topics: dict[str, int] = {}
+    for question in questions:
+        available_topics[question["technology"]] = available_topics.get(question["technology"], 0) + 1
+    topic_weights, reasoning = relevant_question_topic_weights(
+        job, resume, saved_profile_json, available_topics
+    )
+    relevant_questions = [
+        question for question in questions
+        if question["technology"].casefold() in {topic.casefold() for topic in topic_weights}
+    ]
+    target_count = (
+        job["assessment_question_count"]
+        if ("assessment_question_count" in job.keys() and job["assessment_question_count"])
+        else 20
+    )
+    manual_topics: list[str] = []
+    if not topic_weights:
+        manual_topics = [topic for topic, count in available_topics.items() if count >= target_count]
+    if len(relevant_questions) < target_count and not manual_topics:
+        additional_needed = target_count - len(relevant_questions)
+        owner = db.execute("SELECT recruiter_id FROM jobs WHERE id = ?", (job["id"],)).fetchone()
+        if owner:
+            already_notified = db.execute(
+                """SELECT 1 FROM notifications WHERE user_id = ? AND type = 'question_bank_incomplete'
+                AND related_application_id = ? LIMIT 1""",
+                (owner["recruiter_id"], application_id),
+            ).fetchone()
+            if not already_notified:
+                notify_user(
+                    db, owner["recruiter_id"], "question_bank_incomplete",
+                    "Candidate is waiting for an assessment",
+                    f"{additional_needed} more relevant active question(s) are needed for {job['title']}.",
+                    application_id=application_id, email=True,
+                )
+            candidate_already_notified = db.execute(
+                """SELECT 1 FROM notifications WHERE user_id = ? AND type = 'assessment_pending'
+                AND related_application_id = ? LIMIT 1""",
+                (candidate_id, application_id),
+            ).fetchone()
+            if not candidate_already_notified:
+                notify_user(
+                    db, candidate_id, "assessment_pending", "Your assessment is being prepared",
+                    f"The hiring team is preparing the next step for your {job['title']} application. "
+                    "You’ll receive a notification when it’s ready.",
+                    application_id=application_id,
+                )
+        return
+    status = "Manual Topic Required" if manual_topics else "Not Sent"
+    topics = manual_topics if manual_topics else list(topic_weights)
+    technology = None if manual_topics else ", ".join(topics)
+    if manual_topics:
+        reasoning = "No active question topic matched both candidate skills and job requirements; recruiter selection is required."
+    existing = db.execute(
+        "SELECT id, status FROM assessments WHERE application_id = ?", (application_id,)
+    ).fetchone()
+    if existing and existing["status"] == "Completed":
+        return
+    if existing:
+        db.execute("DELETE FROM assessment_questions WHERE assessment_id = ?", (existing["id"],))
+        db.execute(
+            """UPDATE assessments SET candidate_id = ?, job_id = ?, technology = ?,
+            token_hash = NULL, status = ?, match_percentage = ?, starts_at = NULL,
+            expires_at = NULL, submitted_at = NULL, score = NULL, total_questions = 20,
+            assessment_name = ?, assessment_round = 'Round 1', pass_percentage = ?,
+            score_percentage = NULL, correct_answer_count = NULL, incorrect_answer_count = NULL,
+            result = NULL, result_processed_at = NULL, time_taken_seconds = NULL,
+            duration_minutes = ?, email_sent_at = NULL, question_topics_json = ?,
+            question_topic_weights_json = ?, selection_reasoning = ?,
+            proctoring_required = ?, proctoring_consent_at = NULL,
+            camera_permission_granted_at = NULL, proctoring_started_at = NULL,
+            proctoring_warning_count = 0, proctoring_flagged_at = NULL WHERE id = ?""",
+            (
+                candidate_id, job["id"], technology, status, match_percentage,
+                ROUND1_ASSESSMENT_NAME, ROUND1_PASS_PERCENTAGE,
+                ASSESSMENT_DURATION_MINUTES, json.dumps(topics),
+                json.dumps(topic_weights if not manual_topics else {}), reasoning,
+                int(PROCTORING_REQUIRED), existing["id"],
+            ),
+        )
+        db.execute(
+            "DELETE FROM assessment_proctoring_events WHERE assessment_id = ?",
+            (existing["id"],),
+        )
+    else:
+        cursor = db.execute(
+            """INSERT INTO assessments
+            (application_id, candidate_id, job_id, technology, status, match_percentage,
+             total_questions, assessment_name, assessment_round, pass_percentage,
+             duration_minutes, question_topics_json, question_topic_weights_json,
+             selection_reasoning, proctoring_required, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 20, ?, 'Round 1', ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                application_id, candidate_id, job["id"], technology, status, match_percentage,
+                ROUND1_ASSESSMENT_NAME, ROUND1_PASS_PERCENTAGE,
+                ASSESSMENT_DURATION_MINUTES, json.dumps(topics),
+                json.dumps(topic_weights if not manual_topics else {}), reasoning,
+                int(PROCTORING_REQUIRED), now(),
+            ),
+        )
+
+
+def extract_text_via_gemini_vision(content: bytes, mime_type: str) -> str:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if not gemini_key:
+        return ""
+    import base64
+    b64 = base64.b64encode(content).decode("utf-8")
+    target_mime = mime_type if mime_type in {"application/pdf", "image/jpeg", "image/png"} else "application/pdf"
+    for model in ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+            payload = {
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": "Transcribe and extract all resume text from this document accurately, including contact information, education, work experience, and skills. Return ONLY the extracted plain text without markdown or commentary."},
+                            {"inline_data": {"mime_type": target_mime, "data": b64}}
+                        ]
+                    }
+                ],
+                "generationConfig": {"temperature": 0.1}
+            }
+            with httpx.Client(timeout=25.0) as client:
+                res = client.post(url, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
+                    raw_text = parts[0].get("text", "").strip()
+                    if raw_text and len(raw_text) >= 10:
+                        return raw_text
+        except Exception as e:
+            logger.warning("Gemini Vision resume extraction failed with %s: %s", model, e)
+    return ""
+
+
+def extract_resume_text(content: bytes, content_type: str) -> str:
+    if content_type == "text/plain":
+        try:
+            return content.decode("utf-8", errors="ignore").strip()
+        except Exception:
+            return ""
+
+    if content_type == "application/pdf":
+        from pypdf import PdfReader
+        import io
+
+        # Stage 1: Try pypdf text extraction
+        try:
+            reader = PdfReader(io.BytesIO(content))
+            if len(reader.pages) > 40:
+                raise HTTPException(status_code=422, detail="This PDF has too many pages. Please upload a document with 40 pages or fewer.")
+            text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+            if text and len(text) >= 15:
+                return text
+        except HTTPException:
+            raise
+        except Exception as error:
+            logger.warning("pypdf text extraction failed: %s", error)
+
+        # Stage 2: Try pypdfium2 native textpage extraction (extracts text without needing OCR)
+        try:
+            import pypdfium2 as pdfium
+            document = pdfium.PdfDocument(content)
+            pdfium_pages = []
+            for index in range(len(document)):
+                try:
+                    page = document[index]
+                    textpage = page.get_textpage()
+                    pt = textpage.get_text_range()
+                    if pt and pt.strip():
+                        pdfium_pages.append(pt.strip())
+                except Exception:
+                    continue
+            pdfium_text = "\n\n".join(pdfium_pages).strip()
+            if pdfium_text and len(pdfium_text) >= 15:
+                return pdfium_text
+        except Exception as pdfium_err:
+            logger.warning("pypdfium2 native textpage extraction failed: %s", pdfium_err)
+
+        # Stage 3: Try local Tesseract OCR (if installed)
+        try:
+            import pypdfium2 as pdfium
+            import pytesseract
+
+            document = pdfium.PdfDocument(content)
+            pages = []
+            for index in range(min(len(document), 10)):
+                image = document[index].render(scale=1.5).to_pil()
+                page_ocr = pytesseract.image_to_string(image).strip()
+                if page_ocr:
+                    pages.append(page_ocr)
+            ocr_text = "\n\n".join(pages).strip()
+            if ocr_text and len(ocr_text) >= 15:
+                return ocr_text
+        except Exception as ocr_error:
+            logger.warning("Scanned PDF local OCR could not be performed: %s", ocr_error)
+
+        # Stage 4: Try Gemini Vision OCR (if GEMINI_API_KEY is configured)
+        gemini_text = extract_text_via_gemini_vision(content, "application/pdf")
+        if gemini_text:
+            return gemini_text
+
+        return ""
+
+    if content_type in {"image/jpeg", "image/png"}:
+        from PIL import Image
+        import io
+
+        try:
+            image = Image.open(io.BytesIO(content))
+            image.verify()
+            image = Image.open(io.BytesIO(content)).convert("RGB")
+        except Exception as error:
+            raise HTTPException(status_code=422, detail="This image is unreadable or corrupted. Please check the file and try again.") from error
+
+        # Stage 1: Try local Tesseract OCR
+        try:
+            import pytesseract
+            ocr_res = pytesseract.image_to_string(image).strip()
+            if ocr_res and len(ocr_res) >= 15:
+                return ocr_res
+        except Exception as ocr_error:
+            logger.warning("Image local OCR could not be performed: %s", ocr_error)
+
+        # Stage 2: Try Gemini Vision OCR
+        gemini_text = extract_text_via_gemini_vision(content, content_type)
+        if gemini_text:
+            return gemini_text
+
+        return ""
+
+    return ""
+
+
+@app.on_event("startup")
+def startup() -> None:
+    initialize_database()
+
+
+@app.get("/")
+def home() -> FileResponse:
+    return FileResponse(FRONTEND_DIR / "index.html")
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    """Health-check endpoint for load balancers and uptime monitors."""
+    db_ok = False
+    try:
+        with connect() as db:
+            db.execute("SELECT 1").fetchone()
+        db_ok = True
+    except Exception:
+        logger.exception("Health check: database is unavailable")
+    status = "ok" if db_ok else "degraded"
+    return {"status": status, "database": "ok" if db_ok else "unavailable", "version": "1.0.0"}
+
+
+@app.post("/api/auth/register", status_code=201)
+@limiter.limit("10/minute")
+def register(request: Request, body: RegisterBody) -> dict[str, Any]:
+    role = body.role.lower()
+    if role not in {"candidate", "recruiter"}:
+        raise HTTPException(status_code=422, detail="Choose a job seeker or recruiter account")
+    try:
+        with connect() as db:
+            cursor = db.execute(
+                "INSERT INTO users (name, email, password_hash, role, created_at) VALUES (?, ?, ?, ?, ?)",
+                (body.name.strip(), body.email.lower(), password_hash(body.password), role, now()),
+            )
+            row = db.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    except sqlite3.IntegrityError as error:
+        raise HTTPException(status_code=409, detail="An account with this email already exists") from error
+    user = public_user(row)
+    return {"access_token": encode_token(row), "token_type": "bearer", "user": user}
+
+
+@app.post("/api/auth/login")
+@limiter.limit("20/minute")
+def login(request: Request, body: LoginBody) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute("SELECT * FROM users WHERE email = ?", (body.email.lower(),)).fetchone()
+    if not row or not row["active"] or not check_password(body.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Email or password is incorrect")
+    return {"access_token": encode_token(row), "token_type": "bearer", "user": public_user(row)}
+
+
+class AuthSessionBody(BaseModel):
+    access_token: str
+
+
+@app.get("/api/auth/csrf")
+def csrf() -> JSONResponse:
+    value = generate_csrf_token()
+    response = JSONResponse({"csrf_token": value})
+    response.set_cookie(CSRF_COOKIE_NAME, value, **csrf_cookie_settings())
+    return response
+
+
+@app.post("/api/auth/session")
+def auth_session(body: AuthSessionBody) -> JSONResponse:
+    user = get_current_user(token=body.access_token)
+    value = generate_csrf_token()
+    response = JSONResponse({"status": "ok", "csrf_token": value, "user": user})
+    response.set_cookie(AUTH_COOKIE_NAME, body.access_token, **auth_cookie_settings())
+    response.set_cookie(CSRF_COOKIE_NAME, value, **csrf_cookie_settings())
+    return response
+
+
+@app.post("/api/auth/logout")
+def logout() -> JSONResponse:
+    response = JSONResponse({"status": "ok"})
+    for name in (AUTH_COOKIE_NAME, CSRF_COOKIE_NAME):
+        response.delete_cookie(name, path=COOKIE_PATH, samesite="Lax", secure=_is_production())
+    return response
+
+
+@app.get("/api/me")
+def me(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return user
+
+
+@app.get("/api/jobs")
+def list_jobs(
+    q: str = "",
+    location: str = "",
+    job_type: str = "",
+    experience: str = "",
+    skill: str = "",
+    mine: bool = False,
+    sort_by: str = "newest",
+    page: int = 1,
+    page_size: int = 50,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(status_code=422, detail="Page must be positive and page size must be between 1 and 100")
+    clauses = ["j.status = 'Open'"]
+    values: list[Any] = []
+    if mine:
+        if user["role"] != "recruiter":
+            raise HTTPException(status_code=403, detail="Only recruiters can view their own job listings")
+        clauses.remove("j.status = 'Open'")  # recruiters also see closed roles so they can reopen them
+        clauses.append("j.recruiter_id = ?")
+        values.append(user["id"])
+    if q.strip():
+        like = f"%{q.strip()}%"
+        clauses.append("(j.title LIKE ? OR j.company LIKE ? OR j.description LIKE ? OR j.skills_json LIKE ?)")
+        values.extend([like, like, like, like])
+    if location.strip():
+        clauses.append("j.location LIKE ?")
+        values.append(f"%{location.strip()}%")
+    if job_type.strip():
+        clauses.append("j.job_type = ?")
+        values.append(job_type.strip())
+    if experience.strip():
+        clauses.append("j.experience LIKE ?")
+        values.append(f"%{experience.strip()}%")
+    if skill.strip():
+        clauses.append("j.skills_json LIKE ?")
+        values.append(f"%{skill.strip()}%")
+    sort_options = {
+        "newest": "j.created_at DESC",
+        "company": "j.company COLLATE NOCASE ASC",
+        "title": "j.title COLLATE NOCASE ASC",
+    }
+    if sort_by not in sort_options:
+        raise HTTPException(status_code=422, detail="Choose a valid job sort order")
+    where = " AND ".join(clauses)
+    with connect() as db:
+        total = db.execute(f"SELECT COUNT(*) FROM jobs j WHERE {where}", values).fetchone()[0]
+        rows = db.execute(
+            f"SELECT j.* FROM jobs j WHERE {where} ORDER BY {sort_options[sort_by]}, j.id ASC LIMIT ? OFFSET ?",
+            [*values, page_size, (page - 1) * page_size],
+        ).fetchall()
+    return {"items": [public_job(row) for row in rows], "total": total, "page": page, "page_size": page_size}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    del user
+    with connect() as db:
+        row = db.execute("SELECT * FROM jobs WHERE id = ? AND status = 'Open'", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="This role is no longer available")
+    return public_job(row)
+
+
+@app.post("/api/jobs", status_code=201)
+def create_job(body: JobBody, user: dict[str, Any] = Depends(require_role("recruiter", "admin"))) -> dict[str, Any]:
+    if len((body.description or "").strip()) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail="Job description must contain at least 20 characters before you can post this job.",
+        )
+    skills = list(dict.fromkeys(skill.strip() for skill in body.skills if skill.strip()))
+    if not skills:
+        raise HTTPException(status_code=422, detail="Add at least one required skill")
+    with connect() as db:
+        cursor = db.execute(
+            """INSERT INTO jobs (recruiter_id, title, company, description, location, experience, job_type, salary, skills_json, assessment_question_count, allow_detailed_results, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user["id"], body.title.strip(), body.company.strip(), body.description.strip(), body.location.strip(),
+             body.experience.strip(), body.job_type.strip(), body.salary.strip(), json.dumps(skills),
+             body.assessment_question_count, 1 if body.allow_detailed_results else 0, now()),
+        )
+        row = db.execute("SELECT * FROM jobs WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        admins = db.execute("SELECT id FROM users WHERE role = 'admin' AND active = 1").fetchall()
+        for admin in admins:
+            add_notification(
+                db, admin["id"], "job_posted", "New job posted",
+                f"{body.title} was posted by {body.company}.",
+            )
+    return public_job(row)
+
+
+@app.patch("/api/jobs/{job_id}")
+def update_job(
+    job_id: int,
+    body: JobBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    skills = list(dict.fromkeys(skill.strip() for skill in body.skills if skill.strip()))
+    if not skills:
+        raise HTTPException(status_code=422, detail="Add at least one required skill")
+    with connect() as db:
+        owned_job(db, job_id, user)
+        db.execute(
+            """UPDATE jobs SET title = ?, company = ?, description = ?, location = ?, experience = ?,
+            job_type = ?, salary = ?, skills_json = ?, assessment_question_count = ?, allow_detailed_results = ?
+            WHERE id = ?""",
+            (
+                body.title.strip(), body.company.strip(), body.description.strip(), body.location.strip(),
+                body.experience.strip(), body.job_type.strip(), body.salary.strip(), json.dumps(skills),
+                body.assessment_question_count, 1 if body.allow_detailed_results else 0, job_id,
+            ),
+        )
+        row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return public_job(row)
+
+
+@app.patch("/api/jobs/{job_id}/status")
+def set_own_job_status(
+    job_id: int,
+    body: JobStatusBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    if body.status not in {"Open", "Closed"}:
+        raise HTTPException(status_code=422, detail="Choose Open or Closed")
+    with connect() as db:
+        owned_job(db, job_id, user)
+        db.execute("UPDATE jobs SET status = ? WHERE id = ?", (body.status, job_id))
+    return {"id": job_id, "status": body.status}
+
+
+@app.patch("/api/jobs/{job_id}/assessment-settings")
+def update_job_assessment_settings(
+    job_id: int,
+    body: JobAssessmentSettingsBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+        db.execute(
+            """UPDATE jobs SET assessment_question_count = ?, allow_detailed_results = ?
+            WHERE id = ?""",
+            (body.assessment_question_count, 1 if body.allow_detailed_results else 0, job_id),
+        )
+        row = db.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    return public_job(row)
+
+
+def owned_job(db: sqlite3.Connection, job_id: int, user: dict[str, Any]) -> sqlite3.Row:
+    job = db.execute(
+        "SELECT * FROM jobs WHERE id = ? AND (? = 'admin' OR recruiter_id = ?)",
+        (job_id, user["role"], user["id"]),
+    ).fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job listing not found for your account")
+    return job
+
+
+def validated_question(body: QuestionBody) -> tuple[str, str, list[str], int, str, int, str, str, str]:
+    technology = body.technology.strip()
+    question = body.question.strip()
+    if not technology or not question:
+        raise HTTPException(status_code=422, detail="Technology and question text are required")
+    options = [option.strip() for option in body.options]
+    if any(not option for option in options) or len({option.casefold() for option in options}) != 4:
+        raise HTTPException(status_code=422, detail="Provide four distinct, non-empty answer options")
+    return (
+        technology, question, options,
+        body.correct_index, body.difficulty, int(body.active),
+        body.explanation.strip(), body.learning_resource_url.strip(), body.subtopic.strip(),
+    )
+
+
+def job_question_summary(db: sqlite3.Connection, job_id: int) -> dict[str, Any]:
+    job = db.execute("SELECT assessment_question_count FROM jobs WHERE id = ?", (job_id,)).fetchone()
+    target_count = (job["assessment_question_count"] if job and job["assessment_question_count"] else 20)
+    difficulty_rows = db.execute(
+        """SELECT technology, difficulty, COUNT(*) AS active_count
+        FROM job_questions WHERE job_id = ? AND active = 1
+        GROUP BY technology, difficulty ORDER BY technology, difficulty""",
+        (job_id,),
+    ).fetchall()
+    by_technology: dict[str, dict[str, int]] = {}
+    for row in difficulty_rows:
+        by_technology.setdefault(row["technology"], {})[row["difficulty"]] = row["active_count"]
+    technology_rows = db.execute(
+        """SELECT technology, COUNT(*) AS active_count FROM job_questions
+        WHERE job_id = ? AND active = 1 GROUP BY technology ORDER BY technology""",
+        (job_id,),
+    ).fetchall()
+    topics = [
+        {"technology": row["technology"], "active_count": row["active_count"],
+         "difficulty_counts": by_technology.get(row["technology"], {}),
+         "ready": row["active_count"] >= target_count, "additional_needed": max(0, target_count - row["active_count"])}
+        for row in technology_rows
+    ]
+    active_total = sum(topic["active_count"] for topic in topics)
+    needed = max(0, target_count - active_total)
+    total_by_difficulty = {
+        row["difficulty"]: row["active_count"]
+        for row in db.execute(
+            """SELECT difficulty, COUNT(*) AS active_count FROM job_questions
+            WHERE job_id = ? AND active = 1 GROUP BY difficulty""",
+            (job_id,),
+        )
+    }
+    return {
+        "job_id": job_id,
+        "configured_question_count": target_count,
+        "active_count": active_total,
+        "difficulty_counts": total_by_difficulty,
+        "ready": active_total >= target_count,
+        "additional_needed": needed,
+        "topics": topics,
+    }
+
+
+def parse_question_bank_text(text: str) -> list[dict[str, Any]]:
+    questions: list[dict[str, Any]] = []
+    current_technology = ""
+    current_difficulty = "Medium"
+    current_difficulty_valid = True
+    block: dict[str, Any] | None = None
+
+    def finish_block() -> None:
+        nonlocal block
+        if block is None:
+            return
+        source_index = len(questions)
+        question_text = " ".join(line.strip() for line in block["question_lines"] if line.strip()).strip()
+        options = [block["options"].get(label, "").strip() for label in "ABCD"]
+        errors: list[str] = []
+        if not block["technology"]:
+            errors.append(f"Question {source_index + 1} is missing Technology.")
+        if not question_text:
+            errors.append(f"Question {source_index + 1} is missing question text.")
+        for label, option in zip("ABCD", options):
+            if not option:
+                errors.append(f"Question {source_index + 1} is missing option {label}.")
+        for label in sorted(block["duplicate_options"]):
+            errors.append(f"Question {source_index + 1} has duplicate option {label}.")
+        if block["duplicate_answer"]:
+            errors.append(f"Question {source_index + 1} has multiple Answer fields.")
+        if not block["difficulty_valid"]:
+            errors.append(f"Question {source_index + 1} has an invalid difficulty; use Easy, Medium, or Hard.")
+        answer = block["answer"]
+        if answer not in {"A", "B", "C", "D"}:
+            errors.append(f"Question {source_index + 1} has no valid Answer field.")
+        duplicate = any(
+            item["question"].casefold() == question_text.casefold() for item in questions
+            if item["question"]
+        )
+        if duplicate:
+            errors.append(f"Question {source_index + 1} duplicates an earlier question in this PDF.")
+        questions.append({
+            "source_index": source_index,
+            "technology": block["technology"] or "",
+            "difficulty": block["difficulty"] or "Medium",
+            "question": question_text,
+            "options": options,
+            "correct_index": "ABCD".find(answer) if answer in {"A", "B", "C", "D"} else -1,
+            "valid": not errors,
+            "errors": errors,
+            "include": not errors,
+        })
+        block = None
+
+    for raw_line in text.replace("\r", "\n").splitlines():
+        line = raw_line.strip()
+        technology_match = re.match(r"^Technology\s*:\s*(.*)$", line, re.I)
+        difficulty_match = re.match(r"^Difficulty\s*:\s*(.*)$", line, re.I)
+        question_match = re.match(r"^Question\s*:\s*(.*)$", line, re.I)
+        if question_match:
+            finish_block()
+            block = {
+                "technology": current_technology,
+                "difficulty": current_difficulty,
+                "difficulty_valid": current_difficulty_valid,
+                "question_lines": [question_match.group(1).strip()],
+                "options": {},
+                "duplicate_options": set(),
+                "duplicate_answer": False,
+                "current_option": None,
+                "answer": "",
+            }
+            continue
+        if technology_match:
+            finish_block()
+            current_technology = technology_match.group(1).strip()
+            continue
+        if difficulty_match:
+            finish_block()
+            candidate_difficulty = difficulty_match.group(1).strip().capitalize()
+            current_difficulty_valid = candidate_difficulty in {"Easy", "Medium", "Hard"}
+            current_difficulty = candidate_difficulty if current_difficulty_valid else "Medium"
+            continue
+        if block is None or not line:
+            continue
+        option_match = re.match(r"^([A-D])\s*[.)]\s*(.*)$", line, re.I)
+        if option_match:
+            label = option_match.group(1).upper()
+            if label in block["options"]:
+                block["duplicate_options"].add(label)
+            else:
+                block["options"][label] = option_match.group(2).strip()
+            block["current_option"] = label
+            continue
+        answer_match = re.match(r"^Answer\s*:\s*([A-D])\s*$", line, re.I)
+        if answer_match:
+            if block["answer"]:
+                block["duplicate_answer"] = True
+            block["answer"] = answer_match.group(1).upper()
+            block["current_option"] = None
+            continue
+        if re.match(r"^Answer\s*:", line, re.I):
+            if block["answer"]:
+                block["duplicate_answer"] = True
+            block["answer"] = ""
+            block["current_option"] = None
+            continue
+        if block["current_option"]:
+            label = block["current_option"]
+            block["options"][label] = f"{block['options'].get(label, '')} {line}".strip()
+        elif not re.match(r"^[A-D]\s*[.)]", line, re.I):
+            block["question_lines"].append(line)
+    finish_block()
+    return questions
+
+
+def extract_question_bank_pdf_text(content: bytes) -> str:
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(io.BytesIO(content))
+    except Exception as error:
+        raise HTTPException(
+            status_code=422,
+            detail="This PDF is unreadable or corrupted. Please check the file and try again.",
+        ) from error
+    if not reader.pages:
+        raise HTTPException(status_code=422, detail="This PDF does not contain any pages.")
+    if len(reader.pages) > MAX_QUESTION_BANK_PDF_PAGES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"This PDF has too many pages. Upload a document with {MAX_QUESTION_BANK_PDF_PAGES} pages or fewer.",
+        )
+    text = "\n".join(page.extract_text() or "" for page in reader.pages).strip()
+    if not text:
+        try:
+            text = extract_resume_text(content, "application/pdf")
+        except HTTPException as error:
+            raise HTTPException(status_code=422, detail=error.detail) from error
+        except Exception as error:
+            logger.exception("OCR failed while reading a question-bank PDF")
+            raise HTTPException(
+                status_code=422,
+                detail="No readable text was found in this PDF. Install Tesseract OCR or upload a text-based PDF.",
+            ) from error
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail="No readable text was found in this PDF. Install Tesseract OCR or upload a text-based PDF.",
+        )
+    return text
+
+
+def call_llm_json(prompt: str, system: str = "") -> dict[str, Any] | None:
+    gemini_key = os.environ.get("GEMINI_API_KEY")
+    if gemini_key:
+        for model in ["gemini-1.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]:
+            try:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={gemini_key}"
+                payload = {
+                    "contents": [
+                        {"role": "user", "parts": [{"text": f"{system}\n\n{prompt}"}]}
+                    ],
+                    "generationConfig": {
+                        "responseMimeType": "application/json",
+                        "temperature": 0.3,
+                    }
+                }
+                with httpx.Client(timeout=15.0) as client:
+                    res = client.post(url, json=payload)
+                    if res.status_code == 200:
+                        data = res.json()
+                        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])
+                        raw_text = parts[0].get("text", "")
+                        if raw_text:
+                            return json.loads(raw_text)
+            except Exception as e:
+                logger.warning("Gemini %s call failed: %s", model, e)
+
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    if openai_key:
+        try:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {openai_key}", "Content-Type": "application/json"}
+            payload = {
+                "model": "gpt-4o-mini",
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ],
+                "response_format": {"type": "json_object"},
+                "temperature": 0.3
+            }
+            with httpx.Client(timeout=15.0) as client:
+                res = client.post(url, headers=headers, json=payload)
+                if res.status_code == 200:
+                    data = res.json()
+                    raw_text = data["choices"][0]["message"]["content"]
+                    return json.loads(raw_text)
+        except Exception as e:
+            logger.warning("OpenAI API call failed, falling back to local engine: %s", e)
+
+    return None
+
+
+LOCAL_TECH_QUESTION_BANKS: dict[str, list[dict[str, Any]]] = {
+    "Python": [
+        {
+            "subtopic": "List Comprehensions & Lambdas",
+            "difficulty": "Easy",
+            "question": "What is the output of [x**2 for x in range(5) if x % 2 == 1] in Python 3?",
+            "options": ["[1, 9]", "[0, 4, 16]", "[1, 3, 5]", "[1, 4, 9, 16]"],
+            "correct_index": 0,
+            "explanation": "range(5) evaluates to 0, 1, 2, 3, 4. The odd numbers are 1 and 3. Squaring them gives 1 and 9, producing [1, 9].",
+            "learning_resource_url": "https://docs.python.org/3/tutorial/datastructures.html#list-comprehensions"
+        },
+        {
+            "subtopic": "Memory & Mutability",
+            "difficulty": "Medium",
+            "question": "Why is using a mutable default argument like `def add_item(item, target=[])` discouraged in Python?",
+            "options": [
+                "The default list is created once at function definition and shared across all calls.",
+                "Python throws a TypeError when compiling mutable default values.",
+                "Mutable default parameters are automatically converted into tuples at runtime.",
+                "It causes a recursion depth limit error upon successive invocations."
+            ],
+            "correct_index": 0,
+            "explanation": "In Python, default parameter expressions are evaluated once when the function is defined, so subsequent calls without arguments mutate the same list object.",
+            "learning_resource_url": "https://docs.python.org/3/reference/compound_stmts.html#function-definitions"
+        },
+        {
+            "subtopic": "Decorators & Closures",
+            "difficulty": "Medium",
+            "question": "Which standard library decorator preserves the original function's docstring and name when creating a custom decorator?",
+            "options": ["functools.wraps", "functools.lru_cache", "inspect.signature", "contextlib.contextmanager"],
+            "correct_index": 0,
+            "explanation": "@functools.wraps copies the __name__, __doc__, and other attributes from the decorated function onto the inner wrapper.",
+            "learning_resource_url": "https://docs.python.org/3/library/functools.html#functools.wraps"
+        },
+        {
+            "subtopic": "Generators & Iteration",
+            "difficulty": "Hard",
+            "question": "What is the primary architectural difference between `yield` and `yield from` in a Python generator?",
+            "options": [
+                "`yield from` delegates iteration to a subgenerator and bi-directionally forwards values, exceptions, and returns.",
+                "`yield from` converts any generator into an async coroutine automatically.",
+                "`yield from` executes the generator synchronously on a background thread pool.",
+                "`yield from` is deprecated in Python 3.8+ in favor of async generator loops."
+            ],
+            "correct_index": 0,
+            "explanation": "`yield from <subgen>` transparently connects the caller and subgenerator, passing .send() inputs and .throw() exceptions directly.",
+            "learning_resource_url": "https://peps.python.org/pep-0380/"
+        },
+        {
+            "subtopic": "GIL & Concurrency",
+            "difficulty": "Hard",
+            "question": "In standard CPython, how does the Global Interpreter Lock (GIL) affect multi-threaded CPU-bound programs?",
+            "options": [
+                "It allows only one thread to execute Python bytecode at a time, preventing true multi-core CPU speedup.",
+                "It automatically distributes threads across all available CPU cores using kernel interrupts.",
+                "It terminates the process if more than four concurrent threads are spawned.",
+                "It isolates thread memory heaps by duplicating the global namespace."
+            ],
+            "correct_index": 0,
+            "explanation": "CPython's GIL ensures thread safety for memory management, meaning CPU-bound pure Python threads run cooperatively on a single core.",
+            "learning_resource_url": "https://docs.python.org/3/glossary.html#term-global-interpreter-lock"
+        }
+    ],
+    "SQL": [
+        {
+            "subtopic": "Aggregation & Filtering",
+            "difficulty": "Easy",
+            "question": "Which SQL clause is used to filter query results after an aggregate GROUP BY operation?",
+            "options": ["HAVING", "WHERE", "ORDER BY", "QUALIFY"],
+            "correct_index": 0,
+            "explanation": "WHERE filters raw rows before aggregation, whereas HAVING filters grouped rows after aggregation.",
+            "learning_resource_url": "https://en.wikipedia.org/wiki/Having_(SQL)"
+        },
+        {
+            "subtopic": "Window Functions",
+            "difficulty": "Medium",
+            "question": "What is the distinction between `RANK()` and `DENSE_RANK()` window functions when duplicate values occur?",
+            "options": [
+                "RANK() leaves gaps in the rank numbering after ties, whereas DENSE_RANK() never skips ranking numbers.",
+                "DENSE_RANK() skips numbers after ties, while RANK() maintains contiguous sequences.",
+                "RANK() operates only on numeric columns, while DENSE_RANK() operates on text.",
+                "DENSE_RANK() resets the rank back to 1 on every partition without ORDER BY."
+            ],
+            "correct_index": 0,
+            "explanation": "If two rows tie for 1st place, RANK() assigns 1, 1, 3, while DENSE_RANK() assigns 1, 1, 2 without gaps.",
+            "learning_resource_url": "https://www.postgresql.org/docs/current/functions-window.html"
+        },
+        {
+            "subtopic": "Indexing & Execution Plans",
+            "difficulty": "Medium",
+            "question": "What is a 'covering index' in relational databases (RDBMS)?",
+            "options": [
+                "An index containing all columns referenced in the query, allowing index-only scan without table lookups.",
+                "An index that automatically encrypts table data on physical storage disks.",
+                "A clustered index applied to all foreign keys simultaneously.",
+                "An index that automatically partitions tables across database shards."
+            ],
+            "correct_index": 0,
+            "explanation": "A covering index contains all required columns (keys and included columns), so the database engine satisfies the query entirely from the B-tree index.",
+            "learning_resource_url": "https://use-the-index-luke.com/"
+        },
+        {
+            "subtopic": "Transactions & ACID",
+            "difficulty": "Hard",
+            "question": "Which transaction isolation level prevents dirty reads, non-repeatable reads, and phantom reads in ANSI SQL?",
+            "options": ["SERIALIZABLE", "REPEATABLE READ", "READ COMMITTED", "READ UNCOMMITTED"],
+            "correct_index": 0,
+            "explanation": "SERIALIZABLE is the highest isolation level and prevents dirty reads, non-repeatable reads, and phantom reads by simulating completely sequential execution.",
+            "learning_resource_url": "https://en.wikipedia.org/wiki/Isolation_(database_systems)"
+        },
+        {
+            "subtopic": "CTE & Recursive Queries",
+            "difficulty": "Hard",
+            "question": "In a Common Table Expression (WITH RECURSIVE), what two query components are separated by the UNION ALL operator?",
+            "options": [
+                "The base anchor member query and the recursive member query.",
+                "The primary key constraint and the foreign key index.",
+                "The aggregation subquery and the partition filter clause.",
+                "The transaction lock statement and the commit rollback hook."
+            ],
+            "correct_index": 0,
+            "explanation": "A recursive CTE consists of an anchor member (which establishes the initial result set) and a recursive member joined via UNION or UNION ALL.",
+            "learning_resource_url": "https://www.postgresql.org/docs/current/queries-with.html"
+        }
+    ],
+    "JavaScript": [
+        {
+            "subtopic": "Event Loop & Concurrency",
+            "difficulty": "Medium",
+            "question": "In what order does JavaScript execute microtasks (e.g. Promise callbacks) vs macrotasks (e.g. setTimeout)?",
+            "options": [
+                "All queued microtasks run immediately after current synchronous code, before the next macrotask.",
+                "Macrotasks execute first, followed by microtasks only when the browser window blurs.",
+                "Microtasks and macrotasks are interleaved alternately in a round-robin schedule.",
+                "Microtasks run only in Web Worker threads and do not block the main event loop."
+            ],
+            "correct_index": 0,
+            "explanation": "The JavaScript event loop drains the entire microtask queue (Promise.then, queueMicrotask) before executing the next macrotask (setTimeout, setInterval).",
+            "learning_resource_url": "https://developer.mozilla.org/en-US/docs/Web/API/HTML_DOM_API/Microtask_guide"
+        },
+        {
+            "subtopic": "Scopes & Closures",
+            "difficulty": "Easy",
+            "question": "What is the scoping difference between `var` and `let` in JavaScript?",
+            "options": [
+                "`var` is function-scoped and hoisted with undefined; `let` is block-scoped with a temporal dead zone.",
+                "`let` variables are shared globally across window objects, while `var` is strictly local.",
+                "`var` creates immutable bindings, while `let` allows variable reassignment.",
+                "There is no difference in modern ES6+ ECMAScript engines."
+            ],
+            "correct_index": 0,
+            "explanation": "`var` attaches to the nearest function scope, while `let` adheres strictly to curly-bracket blocks `{}` and cannot be accessed before declaration.",
+            "learning_resource_url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Statements/let"
+        },
+        {
+            "subtopic": "Prototypes & Inheritance",
+            "difficulty": "Hard",
+            "question": "What does `Object.create(proto)` do under the hood in JavaScript?",
+            "options": [
+                "Creates a new object whose internal prototype ([[Prototype]]) is explicitly set to `proto`.",
+                "Clones all enumerable properties of `proto` using structured deep-copy cloning.",
+                "Freezes the `proto` object and converts its methods into static class attributes.",
+                "Instantiates a singleton proxy that intercepts getter and setter operations."
+            ],
+            "correct_index": 0,
+            "explanation": "Object.create creates a new empty object that inherits directly from the passed prototype object in the prototype chain.",
+            "learning_resource_url": "https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Object/create"
+        }
+    ],
+    "React": [
+        {
+            "subtopic": "Hooks & State",
+            "difficulty": "Easy",
+            "question": "Why must React Hooks (like `useState` and `useEffect`) always be called at the top level of a component?",
+            "options": [
+                "React relies on the call order of hooks across renders to preserve state across invocations.",
+                "Calling hooks in conditionals triggers a memory leak in the browser DOM engine.",
+                "Hooks compile to global variables that collide when called inside loop blocks.",
+                "Virtual DOM nodes cannot re-render if hooks are nested inside callbacks."
+            ],
+            "correct_index": 0,
+            "explanation": "React stores hook states in an internal array/linked list mapped to the component instance; consistent execution order is required to map state slots accurately.",
+            "learning_resource_url": "https://react.dev/warnings/invalid-hook-call-warning"
+        },
+        {
+            "subtopic": "Performance & Memoization",
+            "difficulty": "Medium",
+            "question": "When should you use `useCallback` instead of an inline function in React?",
+            "options": [
+                "When passing the callback to a memoized child component (`React.memo`) to avoid unnecessary re-renders.",
+                "To automatically run the function asynchronously on a web worker thread.",
+                "Whenever a function performs an HTTP network request via fetch.",
+                "To prevent the component from mounting multiple times during initial page load."
+            ],
+            "correct_index": 0,
+            "explanation": "useCallback caches a function definition between renders, which prevents breaking shallow reference checks on memoized child components.",
+            "learning_resource_url": "https://react.dev/reference/react/useCallback"
+        }
+    ]
+}
+
+
+def generate_questions_local(
+    technology: str,
+    count: int = 5,
+    difficulty: str = "Mixed",
+    subtopic: str = "",
+    custom_prompt: str = ""
+) -> list[dict[str, Any]]:
+    # Normalize tech name lookup
+    matched_key = next((k for k in LOCAL_TECH_QUESTION_BANKS if k.lower() == technology.lower()), None)
+    bank = list(LOCAL_TECH_QUESTION_BANKS.get(matched_key, [])) if matched_key else []
+
+    results: list[dict[str, Any]] = []
+
+    # Filter bank by requested difficulty if specific
+    if bank:
+        if difficulty in {"Easy", "Medium", "Hard"}:
+            bank_diff = [q for q in bank if q["difficulty"] == difficulty]
+            if bank_diff:
+                bank = bank_diff
+        random.shuffle(bank)
+        for item in bank:
+            if len(results) >= count:
+                break
+            results.append({
+                "technology": technology,
+                "subtopic": item.get("subtopic") or (subtopic or f"{technology} Core"),
+                "difficulty": item.get("difficulty") or (difficulty if difficulty != "Mixed" else "Medium"),
+                "question": item["question"],
+                "options": list(item["options"]),
+                "correct_index": item["correct_index"],
+                "explanation": item["explanation"],
+                "learning_resource_url": item.get("learning_resource_url", ""),
+                "active": True
+            })
+
+    # Procedural generation if more questions are needed
+    procedural_topics = [
+        ("Architecture & Design", "Medium", "Which design principle is considered best practice when structuring modular components in {tech}?"),
+        ("Error Handling & Diagnostics", "Easy", "What is the recommended approach for intercepting and handling unexpected runtime exceptions in {tech}?"),
+        ("Performance & Scaling", "Hard", "Which strategy provides the most effective throughput optimization when processing high concurrency in {tech}?"),
+        ("Security & Validation", "Medium", "What primary security mechanism protects against injection and untrusted input vulnerabilities in {tech}?"),
+        ("Testing & Quality Assurance", "Easy", "When implementing unit and integration tests in {tech}, what is the primary benefit of test isolation?"),
+        ("Memory & Resource Management", "Hard", "How does the runtime engine of {tech} handle resource cleanup and prevent memory leaks over time?"),
+        ("Data Transformation & Flow", "Medium", "Which pattern ensures predictable data mutations and immutable state transitions in {tech}?"),
+        ("Dependency Management & Isolation", "Easy", "Why is sandboxed dependency isolation recommended when configuring deployment pipelines for {tech}?")
+    ]
+
+    needed = count - len(results)
+    for i in range(needed):
+        topic_name, diff, q_tmpl = procedural_topics[i % len(procedural_topics)]
+        final_diff = difficulty if difficulty in {"Easy", "Medium", "Hard"} else diff
+        target_subtopic = subtopic or f"{technology} {topic_name}"
+
+        q_text = q_tmpl.format(tech=technology)
+        if custom_prompt:
+            q_text += f" (Scenario: {custom_prompt[:60]}...)"
+
+        correct_ans = f"Decoupling components through well-defined interfaces and adhering to standard {technology} conventions."
+        opt_b = f"Bypassing validation layers to maximize raw I/O throughput in high-load clusters."
+        opt_c = f"Storing mutable state globally across all shared threads without locking."
+        opt_d = f"Disabling strict type and boundary checking to suppress runtime warnings."
+
+        options = [correct_ans, opt_b, opt_c, opt_d]
+        random.shuffle(options)
+        c_idx = options.index(correct_ans)
+
+        results.append({
+            "technology": technology,
+            "subtopic": target_subtopic,
+            "difficulty": final_diff,
+            "question": q_text,
+            "options": options,
+            "correct_index": c_idx,
+            "explanation": f"In {technology}, robust implementations prioritize loose coupling, standardized lifecycle management, and verified boundary validation.",
+            "learning_resource_url": "",
+            "active": True
+        })
+
+    return results[:count]
+
+
+def generate_ai_questions(
+    technology: str,
+    count: int = 5,
+    difficulty: str = "Mixed",
+    subtopic: str = "",
+    custom_prompt: str = ""
+) -> list[dict[str, Any]]:
+    sys_prompt = (
+        "You are an expert technical interviewer and assessment designer. "
+        "Generate realistic, challenging multiple-choice technical questions for candidate assessments. "
+        "Respond ONLY with a JSON object in this exact schema:\n"
+        "{\n"
+        "  \"questions\": [\n"
+        "    {\n"
+        "      \"technology\": \"string\",\n"
+        "      \"subtopic\": \"string\",\n"
+        "      \"difficulty\": \"Easy\" | \"Medium\" | \"Hard\",\n"
+        "      \"question\": \"string (at least 15 characters, clear and unambiguous)\",\n"
+        "      \"options\": [\"opt 1\", \"opt 2\", \"opt 3\", \"opt 4\"],\n"
+        "      \"correct_index\": 0,\n"
+        "      \"explanation\": \"string (concise technical reason why this option is correct)\",\n"
+        "      \"learning_resource_url\": \"string\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "Ensure each question has exactly 4 options with only ONE objectively correct answer."
+    )
+    user_prompt = f"Generate {count} {difficulty} questions for technology '{technology}'."
+    if subtopic:
+        user_prompt += f" Focus on subtopic: '{subtopic}'."
+    if custom_prompt:
+        user_prompt += f" Specific instructions: '{custom_prompt}'."
+
+    llm_res = call_llm_json(user_prompt, sys_prompt)
+    if llm_res and isinstance(llm_res, dict) and isinstance(llm_res.get("questions"), list):
+        cleaned: list[dict[str, Any]] = []
+        for q in llm_res["questions"]:
+            if not isinstance(q, dict):
+                continue
+            opts = q.get("options")
+            if not isinstance(opts, list) or len(opts) != 4:
+                continue
+            idx = q.get("correct_index", 0)
+            if not isinstance(idx, int) or not (0 <= idx <= 3):
+                idx = 0
+            diff = str(q.get("difficulty", "Medium")).capitalize()
+            if diff not in {"Easy", "Medium", "Hard"}:
+                diff = "Medium"
+            q_text = str(q.get("question", "")).strip()
+            if len(q_text) < 10:
+                continue
+            cleaned.append({
+                "technology": str(q.get("technology", technology)).strip() or technology,
+                "subtopic": str(q.get("subtopic", subtopic)).strip(),
+                "difficulty": diff,
+                "question": q_text,
+                "options": [str(o).strip() for o in opts],
+                "correct_index": idx,
+                "explanation": str(q.get("explanation", "")).strip(),
+                "learning_resource_url": str(q.get("learning_resource_url", "")).strip(),
+                "active": True
+            })
+        if len(cleaned) >= count:
+            return cleaned[:count]
+        if cleaned:
+            # Supplement remaining count
+            needed = count - len(cleaned)
+            fallback = generate_questions_local(technology, needed, difficulty, subtopic, custom_prompt)
+            return (cleaned + fallback)[:count]
+
+    return generate_questions_local(technology, count, difficulty, subtopic, custom_prompt)
+
+
+def synthesize_candidate_ai_summary(
+    db: sqlite3.Connection,
+    application_id: int,
+    force_refresh: bool = False
+) -> dict[str, Any]:
+    # Gather application profile
+    app_row = db.execute(
+        """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage,
+        a.matched_skills_json, a.missing_skills_json, a.applied_at,
+        u.name AS candidate_name, u.email AS candidate_email,
+        j.title AS job_title, j.company AS job_company, j.skills_json AS job_skills_json,
+        j.experience AS job_experience,
+        r.extracted_text AS resume_text
+        FROM applications a
+        JOIN users u ON u.id = a.candidate_id
+        JOIN jobs j ON j.id = a.job_id
+        LEFT JOIN resumes r ON r.candidate_id = a.candidate_id
+        WHERE a.id = ?""",
+        (application_id,)
+    ).fetchone()
+    if not app_row:
+        raise HTTPException(status_code=404, detail="Application not found")
+
+    matched_skills = json.loads(app_row["matched_skills_json"] or "[]")
+    missing_skills = json.loads(app_row["missing_skills_json"] or "[]")
+    job_skills = json.loads(app_row["job_skills_json"] or "[]")
+    match_pct = app_row["match_percentage"] or 0
+
+    # Gather assessment data if available
+    assess_row = db.execute(
+        """SELECT x.id, x.status, x.technology, x.total_questions, x.pass_percentage,
+        x.score_percentage, x.correct_answer_count, x.incorrect_answer_count,
+        x.result, x.time_taken_seconds, x.proctoring_warning_count, x.proctoring_flagged_at
+        FROM assessments x WHERE x.application_id = ?""",
+        (application_id,)
+    ).fetchone()
+
+    test_taken = assess_row and assess_row["status"] in {"Completed", "Pending Recruiter Decision"}
+    test_score = assess_row["score_percentage"] if test_taken else None
+    pass_pct = assess_row["pass_percentage"] if assess_row else 75
+    test_result = assess_row["result"] if test_taken else None
+    proctor_warnings = assess_row["proctoring_warning_count"] if assess_row else 0
+    proctor_flagged = bool(assess_row and assess_row["proctoring_flagged_at"])
+
+    if not force_refresh:
+        cached = db.execute(
+            """SELECT id, application_id, recommendation, summary, strengths_json,
+            risks_json, interview_questions_json, created_at, updated_at
+            FROM candidate_ai_summaries WHERE application_id = ?""",
+            (application_id,)
+        ).fetchone()
+        if cached:
+            raw_questions = json.loads(cached["interview_questions_json"] or "[]")
+            norm_q = []
+            for item in raw_questions:
+                if isinstance(item, dict) and "question" in item:
+                    norm_q.append(item)
+                else:
+                    norm_q.append({
+                        "question": str(item),
+                        "focus_area": "Technical Competency",
+                        "what_to_look_for": "Problem-solving methodology, practical depth, and clear communication."
+                    })
+            return {
+                "id": cached["id"],
+                "application_id": cached["application_id"],
+                "candidate_name": app_row["candidate_name"],
+                "candidate_email": app_row["candidate_email"],
+                "job_title": app_row["job_title"],
+                "company": app_row["job_company"],
+                "resume_match_percentage": match_pct,
+                "assessment_score_percentage": test_score,
+                "assessment_result": test_result,
+                "assessment_status": assess_row["status"] if assess_row else (app_row["status"] or "Not Issued"),
+                "proctoring_flagged": proctor_flagged,
+                "proctoring_warning_count": proctor_warnings,
+                "recommendation": cached["recommendation"],
+                "summary": cached["summary"],
+                "strengths": json.loads(cached["strengths_json"] or "[]"),
+                "risks": json.loads(cached["risks_json"] or "[]"),
+                "interview_questions": norm_q,
+                "created_at": cached["created_at"],
+                "updated_at": cached["updated_at"],
+            }
+
+    # Try calling LLM for rich executive summary
+    sys_prompt = (
+        "You are an expert talent acquisition director and technical screener. "
+        "Review the candidate's application details, resume alignment, technical assessment scores, and proctoring integrity. "
+        "Return a strictly valid JSON response with the following schema:\n"
+        "{\n"
+        "  \"recommendation\": \"Strong Hire\" | \"Recommended\" | \"Borderline\" | \"Not Recommended\",\n"
+        "  \"summary\": \"A concise, balanced 2-3 sentence executive screening summary covering qualifications, test outcome, and candidate standing.\",\n"
+        "  \"strengths\": [\"string\", \"string\", \"string\"],\n"
+        "  \"risks\": [\"string\", \"string\"],\n"
+        "  \"interview_questions\": [\"string (targeted technical question for Round 2)\", \"string\", \"string\"]\n"
+        "}"
+    )
+    user_prompt = f"""
+Candidate: {app_row['candidate_name']} ({app_row['candidate_email']})
+Job Opening: {app_row['job_title']} at {app_row['job_company']}
+Required Experience: {app_row['job_experience']}
+Required Skills: {', '.join(job_skills)}
+Resume Match: {match_pct}% (Matched: {', '.join(matched_skills) or 'None'}; Missing: {', '.join(missing_skills) or 'None'})
+Assessment Status: {assess_row['status'] if assess_row else 'Not Issued'}
+Assessment Outcome: {f"Score: {test_score}% ({test_result}); Pass Required: {pass_pct}%" if test_taken else "Assessment not yet completed"}
+Proctoring Signals: {proctor_warnings} warnings logged; Flagged: {'Yes' if proctor_flagged else 'No'}
+"""
+    llm_summary = call_llm_json(user_prompt, sys_prompt)
+
+    recommendation = "Recommended"
+    summary_text = ""
+    strengths: list[str] = []
+    risks: list[str] = []
+    interview_questions: list[str] = []
+
+    if llm_summary and isinstance(llm_summary, dict) and "recommendation" in llm_summary:
+        rec_cand = str(llm_summary.get("recommendation", "")).strip()
+        if rec_cand in {"Strong Hire", "Recommended", "Borderline", "Not Recommended"}:
+            recommendation = rec_cand
+        summary_text = str(llm_summary.get("summary", "")).strip()
+        strengths = [str(s).strip() for s in llm_summary.get("strengths", []) if s]
+        risks = [str(r).strip() for r in llm_summary.get("risks", []) if r]
+        interview_questions = [str(q).strip() for q in llm_summary.get("interview_questions", []) if q]
+
+    if not summary_text:
+        # Deterministic local synthesis
+        if test_taken:
+            if test_result == "Passed" and (test_score or 0) >= 85 and proctor_warnings == 0 and match_pct >= 80:
+                recommendation = "Strong Hire"
+                summary_text = (
+                    f"{app_row['candidate_name']} demonstrated outstanding technical aptitude with an {test_score}% score "
+                    f"on Round 1 ({assess_row['technology']}) and an {match_pct}% resume alignment with the {app_row['job_title']} position. "
+                    f"Proctoring monitoring was clean with zero suspicious events recorded."
+                )
+            elif test_result == "Passed":
+                if proctor_warnings >= 3 or proctor_flagged:
+                    recommendation = "Borderline"
+                    summary_text = (
+                        f"{app_row['candidate_name']} attained a passing score of {test_score}% on the technical evaluation, "
+                        f"but proctoring recorded {proctor_warnings} warning events (flagged for review). "
+                        f"Recommend verifying technical depth and problem-solving process during the live interview."
+                    )
+                else:
+                    recommendation = "Recommended"
+                    summary_text = (
+                        f"{app_row['candidate_name']} cleared Round 1 with a solid {test_score}% score in {assess_row['technology']}, "
+                        f"exceeding the {pass_pct}% passing benchmark. Resume matches key core competencies including {', '.join(matched_skills[:3])}."
+                    )
+            else:
+                recommendation = "Not Recommended"
+                summary_text = (
+                    f"{app_row['candidate_name']} did not meet the required passing score on the Round 1 technical test "
+                    f"({test_score}% achieved vs {pass_pct}% required in {assess_row['technology']}). "
+                    f"Resume matches {match_pct}% of the job requirements."
+                )
+        else:
+            if match_pct >= 75:
+                recommendation = "Recommended"
+                summary_text = (
+                    f"{app_row['candidate_name']} presents a strong background with {match_pct}% skill alignment for {app_row['job_title']}. "
+                    f"Primary verified skills include {', '.join(matched_skills[:4]) or 'profile match'}. "
+                    f"Awaiting Round 1 technical MCQ assessment completion."
+                )
+            else:
+                recommendation = "Borderline"
+                summary_text = (
+                    f"{app_row['candidate_name']} demonstrates {match_pct}% skill match for {app_row['job_title']}. "
+                    f"Key missing skills include {', '.join(missing_skills[:3]) or 'specified requirements'}. "
+                    f"Technical evaluation is advised before scheduling an interview."
+                )
+
+        # Generate strengths list
+        strengths = [f"Strong background in {skill}" for skill in matched_skills[:4]]
+        if test_taken and test_result == "Passed":
+            strengths.append(f"Scored {test_score}% on {assess_row['technology']} technical MCQ assessment")
+        if test_taken and proctor_warnings == 0:
+            strengths.append("High test integrity: completed proctored assessment with 0 integrity warnings")
+        if not strengths:
+            strengths = ["Resume profile submitted for evaluation", "Relevant industry background"]
+
+        # Generate risks list
+        if missing_skills:
+            risks.append(f"Gaps identified in required skills: {', '.join(missing_skills[:3])}")
+        if test_taken and test_result == "Failed":
+            risks.append(f"Failed Round 1 technical evaluation ({test_score}% achieved vs {pass_pct}% pass mark)")
+        if proctor_warnings > 0:
+            risks.append(f"Proctoring logged {proctor_warnings} warning event(s) during assessment")
+        if not risks:
+            risks = ["Verify hands-on system design and architecture experience during Round 2 interview"]
+
+        # Generate targeted interview questions
+        target_topic = missing_skills[0] if missing_skills else (assess_row['technology'] if assess_row and assess_row['technology'] else 'core technologies')
+        interview_questions = [
+            {
+                "question": f"Can you explain a production challenge you encountered with {target_topic} and how you architected the solution?",
+                "focus_area": f"{target_topic} Architecture",
+                "what_to_look_for": f"Depth of practical experience in {target_topic}, trade-off analysis, concurrency/async handling, and error recovery."
+            },
+            {
+                "question": f"How do you approach automated testing, performance profiling, and reliability in a high-scale {app_row['job_title']} environment?",
+                "focus_area": "Code Quality & Testing",
+                "what_to_look_for": "Structured unit and integration testing habits, CI/CD familiarity, and proactive telemetry monitoring."
+            },
+            {
+                "question": "Describe a scenario where you had to balance rapid delivery against accumulating technical debt when launching a critical feature.",
+                "focus_area": "Engineering Pragmatism",
+                "what_to_look_for": "Pragmatic decision-making, stakeholder communication, and clean refactoring strategies."
+            }
+        ]
+
+    now_iso = now()
+    db.execute(
+        """INSERT INTO candidate_ai_summaries
+        (application_id, recommendation, summary, strengths_json, risks_json,
+         interview_questions_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(application_id) DO UPDATE SET
+        recommendation = excluded.recommendation,
+        summary = excluded.summary,
+        strengths_json = excluded.strengths_json,
+        risks_json = excluded.risks_json,
+        interview_questions_json = excluded.interview_questions_json,
+        updated_at = excluded.updated_at""",
+        (
+            application_id,
+            recommendation,
+            summary_text,
+            json.dumps(strengths),
+            json.dumps(risks),
+            json.dumps(interview_questions),
+            now_iso,
+            now_iso,
+        )
+    )
+
+    return {
+        "application_id": application_id,
+        "candidate_name": app_row["candidate_name"],
+        "candidate_email": app_row["candidate_email"],
+        "job_title": app_row["job_title"],
+        "company": app_row["job_company"],
+        "resume_match_percentage": match_pct,
+        "assessment_score_percentage": test_score,
+        "assessment_result": test_result,
+        "assessment_status": assess_row["status"] if assess_row else (app_row["status"] or "Not Issued"),
+        "proctoring_flagged": proctor_flagged,
+        "proctoring_warning_count": proctor_warnings,
+        "recommendation": recommendation,
+        "summary": summary_text,
+        "strengths": strengths,
+        "risks": risks,
+        "interview_questions": interview_questions,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }
+
+
+def question_import_preview(row: sqlite3.Row) -> dict[str, Any]:
+    questions = json.loads(row["preview_json"] or "[]")
+    valid_questions = [item for item in questions if item["valid"]]
+    invalid_questions = [item for item in questions if not item["valid"]]
+    technology_counts: dict[str, int] = {}
+    difficulty_counts: dict[str, int] = {}
+    for item in questions:
+        if item["technology"]:
+            technology_counts[item["technology"]] = technology_counts.get(item["technology"], 0) + 1
+        if item["difficulty"]:
+            difficulty_counts[item["difficulty"]] = difficulty_counts.get(item["difficulty"], 0) + 1
+    return {
+        "id": row["id"],
+        "job_id": row["job_id"],
+        "filename": row["filename"],
+        "status": row["upload_status"],
+        "total_extracted": row["total_extracted"],
+        "valid_count": row["valid_count"],
+        "invalid_count": row["invalid_count"],
+        "technology_counts": technology_counts,
+        "difficulty_counts": difficulty_counts,
+        "errors": json.loads(row["error_details_json"] or "[]"),
+        "questions": questions,
+        "created_at": row["created_at"],
+        "confirmed_at": row["confirmed_at"],
+        "preview": True,
+    }
+
+
+@app.get("/api/jobs/{job_id}/questions")
+def list_job_questions(
+    job_id: int,
+    technology: str | None = None,
+    difficulty: str | None = None,
+    active: bool | None = None,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+        conditions = ["job_id = ?"]
+        params: list[Any] = [job_id]
+        if technology:
+            conditions.append("lower(technology) = lower(?)")
+            params.append(technology)
+        if difficulty:
+            if difficulty not in {"Easy", "Medium", "Hard"}:
+                raise HTTPException(status_code=422, detail="Choose Easy, Medium, or Hard")
+            conditions.append("difficulty = ?")
+            params.append(difficulty)
+        if active is not None:
+            conditions.append("active = ?")
+            params.append(int(active))
+        questions = db.execute(
+            f"""SELECT id, job_id, technology, question, options_json, correct_index,
+            difficulty, active, source_type, source_import_id, created_at, updated_at FROM job_questions
+            WHERE {' AND '.join(conditions)} ORDER BY technology, difficulty, id""",
+            tuple(params),
+        ).fetchall()
+        return {
+            "items": [
+                {**dict(row), "options": json.loads(row["options_json"]), "options_json": None}
+                for row in questions
+            ],
+            **job_question_summary(db, job_id),
+        }
+
+
+@app.post("/api/jobs/{job_id}/questions", status_code=201)
+def create_job_question(
+    job_id: int,
+    body: QuestionBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    technology, question, options, correct_index, difficulty, active, explanation, learning_resource_url, subtopic = validated_question(body)
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        try:
+            cursor = db.execute(
+                """INSERT INTO job_questions
+                (job_id, owner_id, recruiter_id, technology, question, options_json, correct_index,
+                 difficulty, active, source_type, explanation, learning_resource_url, subtopic, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?)""",
+                (
+                    job_id, job["recruiter_id"], job["recruiter_id"], technology, question, json.dumps(options),
+                    correct_index, difficulty, active, explanation, learning_resource_url, subtopic, now(), now(),
+                ),
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(status_code=409, detail="That question already exists for this job") from error
+        row = db.execute("SELECT * FROM job_questions WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        summary = job_question_summary(db, job_id)
+    if summary["ready"]:
+        auto_send_ready_assessments(job_id)
+    return {**dict(row), "options": options, "options_json": None, "summary": summary}
+
+
+@app.patch("/api/jobs/{job_id}/questions/{question_id}")
+def update_job_question(
+    job_id: int,
+    question_id: int,
+    body: QuestionUpdateBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    technology, question, options, correct_index, difficulty, active, explanation, learning_resource_url, subtopic = validated_question(body)
+    with connect() as db:
+        owned_job(db, job_id, user)
+        try:
+            result = db.execute(
+                """UPDATE job_questions SET technology = ?, question = ?, options_json = ?,
+                correct_index = ?, difficulty = ?, active = ?, explanation = ?,
+                learning_resource_url = ?, subtopic = ?, updated_at = ?
+                WHERE id = ? AND job_id = ?""",
+                (technology, question, json.dumps(options), correct_index, difficulty, active,
+                 explanation, learning_resource_url, subtopic, now(), question_id, job_id),
+            )
+        except sqlite3.IntegrityError as error:
+            raise HTTPException(status_code=409, detail="That question already exists for this job") from error
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Question not found for this job")
+        row = db.execute("SELECT * FROM job_questions WHERE id = ?", (question_id,)).fetchone()
+        summary = job_question_summary(db, job_id)
+    if summary["ready"]:
+        auto_send_ready_assessments(job_id)
+    return {**dict(row), "options": options, "options_json": None}
+
+
+@app.delete("/api/jobs/{job_id}/questions/{question_id}")
+def delete_job_question(
+    job_id: int,
+    question_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, bool]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+        result = db.execute(
+            "DELETE FROM job_questions WHERE id = ? AND job_id = ?", (question_id, job_id)
+        )
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Question not found for this job")
+    return {"deleted": True}
+
+
+@app.post("/api/jobs/{job_id}/questions/ai-generate")
+def ai_generate_questions(
+    job_id: int,
+    body: AIQuestionGenerateBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+    questions = generate_ai_questions(
+        technology=body.technology,
+        count=body.count,
+        difficulty=body.difficulty,
+        subtopic=body.subtopic,
+        custom_prompt=body.custom_prompt,
+    )
+    return {
+        "job_id": job_id,
+        "technology": body.technology,
+        "count": len(questions),
+        "questions": questions,
+    }
+
+
+@app.post("/api/jobs/{job_id}/questions/batch", status_code=201)
+def batch_create_job_questions(
+    job_id: int,
+    body: QuestionBatchBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        created_ids = []
+        now_iso = now()
+        for q in body.questions:
+            technology, question, options, correct_index, difficulty, active, explanation, learning_resource_url, subtopic = validated_question(q)
+            try:
+                cursor = db.execute(
+                    """INSERT INTO job_questions
+                    (job_id, owner_id, recruiter_id, technology, question, options_json, correct_index,
+                     difficulty, active, source_type, explanation, learning_resource_url, subtopic, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'manual', ?, ?, ?, ?, ?)""",
+                    (
+                        job_id, job["recruiter_id"], job["recruiter_id"], technology, question, json.dumps(options),
+                        correct_index, difficulty, active, explanation, learning_resource_url, subtopic, now_iso, now_iso,
+                    ),
+                )
+                created_ids.append(cursor.lastrowid)
+            except sqlite3.IntegrityError:
+                pass
+        summary = job_question_summary(db, job_id)
+    if summary["ready"]:
+        auto_send_ready_assessments(job_id)
+    return {"created": len(created_ids), "summary": summary}
+
+
+@app.get("/api/jobs/{job_id}/question-bank-summary")
+def get_job_question_summary(
+    job_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+        return job_question_summary(db, job_id)
+
+
+@app.post("/api/jobs/{job_id}/question-bank/imports", status_code=201)
+async def preview_question_bank_import(
+    job_id: int,
+    file: UploadFile = File(...),
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        owned_job(db, job_id, user)
+    filename = Path((file.filename or "").replace("\\", "/")).name
+    if Path(filename).suffix.lower() != ".pdf":
+        raise HTTPException(status_code=415, detail="Upload a PDF question bank.")
+    content = await file.read(MAX_QUESTION_BANK_PDF_BYTES + 1)
+    if len(content) > MAX_QUESTION_BANK_PDF_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Question-bank PDFs must be {MAX_QUESTION_BANK_PDF_BYTES // (1024 * 1024)} MB or smaller.",
+        )
+    if not content.startswith(b"%PDF-"):
+        raise HTTPException(status_code=415, detail="The uploaded file does not have a valid PDF signature.")
+
+    text = extract_question_bank_pdf_text(content)
+    questions = parse_question_bank_text(text)
+    if not questions:
+        raise HTTPException(
+            status_code=422,
+            detail="No supported MCQ blocks were found. Please use the provided question-bank template.",
+        )
+    clean_filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename)[:180] or "question-bank.pdf"
+    QUESTION_BANK_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    storage_path = QUESTION_BANK_UPLOAD_DIR / f"{uuid.uuid4().hex}.pdf"
+    storage_path.write_bytes(content)
+    errors = [message for item in questions for message in item["errors"]]
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        cursor = db.execute(
+            """INSERT INTO question_bank_imports
+            (job_id, recruiter_id, filename, storage_path, upload_status, total_extracted,
+             valid_count, invalid_count, preview_json, error_details_json, created_at)
+            VALUES (?, ?, ?, ?, 'Preview', ?, ?, ?, ?, ?, ?)""",
+            (
+                job_id, job["recruiter_id"], clean_filename, str(storage_path),
+                len(questions), sum(bool(item["valid"]) for item in questions),
+                sum(not item["valid"] for item in questions), json.dumps(questions),
+                json.dumps(errors), now(),
+            ),
+        )
+        import_row = db.execute(
+            "SELECT * FROM question_bank_imports WHERE id = ?", (cursor.lastrowid,)
+        ).fetchone()
+        notify_user(
+            db, job["recruiter_id"], "question_bank_import_ready",
+            "Question-bank PDF ready for review",
+            f"{clean_filename} contains {sum(bool(item['valid']) for item in questions)} valid and "
+            f"{sum(not item['valid'] for item in questions)} invalid question blocks for {job['title']}. "
+            "Review the preview before importing.",
+            email=True,
+        )
+        if errors:
+            notify_user(
+                db, job["recruiter_id"], "question_bank_import_invalid",
+                "Some question blocks need attention",
+                f"{len(errors)} issue(s) were found in {clean_filename}. Review the preview before confirming.",
+                email=True,
+            )
+    return question_import_preview(import_row)
+
+
+@app.post("/api/jobs/{job_id}/question-bank/imports/{import_id}/confirm")
+def confirm_question_bank_import(
+    job_id: int,
+    import_id: int,
+    body: QuestionImportConfirmBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        import_row = db.execute(
+            """SELECT * FROM question_bank_imports
+            WHERE id = ? AND job_id = ? AND recruiter_id = ?""",
+            (import_id, job_id, job["recruiter_id"]),
+        ).fetchone()
+        if not import_row:
+            raise HTTPException(status_code=404, detail="Question-bank import not found for this job")
+        if import_row["upload_status"] != "Preview":
+            raise HTTPException(status_code=409, detail="This question-bank import is no longer awaiting review")
+        preview_questions = json.loads(import_row["preview_json"] or "[]")
+        preview_by_index = {item["source_index"]: item for item in preview_questions}
+        seen_sources: set[int] = set()
+        imported_sources: set[int] = set()
+        skipped_sources: set[int] = set()
+        inserted = 0
+        skipped: list[str] = []
+        imported_question_texts: set[str] = set()
+        for approved in body.questions:
+            if not approved.include:
+                continue
+            if approved.source_index not in preview_by_index or approved.source_index in seen_sources:
+                raise HTTPException(status_code=422, detail="An import preview question was missing or duplicated")
+            seen_sources.add(approved.source_index)
+            technology = approved.technology.strip()
+            question = approved.question.strip()
+            options = [option.strip() for option in approved.options]
+            if not technology or not question or len({value.casefold() for value in options}) != 4 or any(not value for value in options):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Question {approved.source_index + 1} needs a technology, question, and four distinct options.",
+                )
+            normalized_question = question.casefold()
+            exists = db.execute(
+                "SELECT 1 FROM job_questions WHERE job_id = ? AND lower(question) = lower(?)",
+                (job_id, question),
+            ).fetchone()
+            if exists or normalized_question in imported_question_texts:
+                skipped.append(f"Question {approved.source_index + 1} duplicates an existing question.")
+                skipped_sources.add(approved.source_index)
+                continue
+            imported_question_texts.add(normalized_question)
+            db.execute(
+                """INSERT INTO job_questions
+                (job_id, owner_id, recruiter_id, technology, question, options_json, correct_index,
+                 difficulty, active, source_type, source_import_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'pdf_import', ?, ?, ?)""",
+                (
+                    job_id, job["recruiter_id"], job["recruiter_id"], technology, question,
+                    json.dumps(options), approved.correct_index, approved.difficulty,
+                    import_id, now(), now(),
+                ),
+            )
+            imported_sources.add(approved.source_index)
+            inserted += 1
+        if not inserted:
+            raise HTTPException(status_code=422, detail="Select at least one valid, non-duplicate question to import.")
+        final_errors = json.loads(import_row["error_details_json"] or "[]") + skipped
+        db.execute(
+            """UPDATE question_bank_imports SET upload_status = 'Confirmed',
+            valid_count = ?, invalid_count = ?, error_details_json = ?, confirmed_at = ?
+            WHERE id = ?""",
+            (
+                inserted,
+                len(
+                    {
+                        item["source_index"]
+                        for item in preview_questions
+                        if not item["valid"] and item["source_index"] not in imported_sources
+                    }
+                    | skipped_sources
+                ),
+                json.dumps(final_errors),
+                now(),
+                import_id,
+            ),
+        )
+        summary = job_question_summary(db, job_id)
+        notify_user(
+            db, job["recruiter_id"], "question_bank_import_completed",
+            "Question-bank import completed",
+            f"Imported {inserted} questions from {import_row['filename']} for {job['title']}.",
+            email=True,
+        )
+        if not summary["ready"]:
+            notify_user(
+                db, job["recruiter_id"], "question_bank_incomplete",
+                "Question bank needs more questions",
+                f"The question bank for {job['title']} has {summary['active_count']} active questions; "
+                f"add {summary['additional_needed']} more to reach 20.",
+                email=True,
+            )
+    auto_send_ready_assessments(job_id)
+    return {
+        "import_id": import_id,
+        "status": "Confirmed",
+        "imported_count": inserted,
+        "skipped_count": len(skipped),
+        "skipped": skipped,
+        "summary": summary,
+    }
+
+
+@app.get("/api/jobs/{job_id}/question-bank/imports")
+def list_question_bank_imports(
+    job_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        rows = db.execute(
+            """SELECT id, job_id, recruiter_id, filename, upload_status, total_extracted,
+            valid_count, invalid_count, error_details_json, created_at, confirmed_at
+            FROM question_bank_imports WHERE job_id = ? AND recruiter_id = ?
+            ORDER BY created_at DESC, id DESC""",
+            (job_id, job["recruiter_id"]),
+        ).fetchall()
+    return {
+        "items": [
+            {
+                **{key: row[key] for key in row.keys() if key != "error_details_json"},
+                "errors": json.loads(row["error_details_json"] or "[]"),
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.get("/api/jobs/{job_id}/question-bank/imports/{import_id}")
+def get_question_bank_import(
+    job_id: int,
+    import_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        row = db.execute(
+            """SELECT * FROM question_bank_imports
+            WHERE id = ? AND job_id = ? AND recruiter_id = ?""",
+            (import_id, job_id, job["recruiter_id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question-bank import not found for this job")
+        if row["upload_status"] != "Preview":
+            raise HTTPException(status_code=409, detail="Only a pending preview can be reviewed")
+        return question_import_preview(row)
+
+
+@app.delete("/api/jobs/{job_id}/question-bank/imports/{import_id}")
+def cancel_question_bank_import(
+    job_id: int,
+    import_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        job = owned_job(db, job_id, user)
+        row = db.execute(
+            """SELECT id, storage_path, upload_status FROM question_bank_imports
+            WHERE id = ? AND job_id = ? AND recruiter_id = ?""",
+            (import_id, job_id, job["recruiter_id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Question-bank import not found for this job")
+        if row["upload_status"] != "Preview":
+            raise HTTPException(status_code=409, detail="Only a pending preview can be cancelled")
+        db.execute(
+            "UPDATE question_bank_imports SET upload_status = 'Cancelled' WHERE id = ?",
+            (import_id,),
+        )
+        try:
+            Path(row["storage_path"]).unlink(missing_ok=True)
+        except OSError:
+            logger.exception("Could not remove cancelled question-bank PDF import %s", import_id)
+    return {"import_id": import_id, "status": "Cancelled"}
+
+
+@app.post("/api/jobs/{job_id}/apply", status_code=201)
+def apply(job_id: int, user: dict[str, Any] = Depends(require_role("candidate"))) -> dict[str, Any]:
+    with connect() as db:
+        job = db.execute("SELECT * FROM jobs WHERE id = ? AND status = 'Open'", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(status_code=404, detail="This role is no longer available")
+        resume = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+        if not resume:
+            raise HTTPException(status_code=409, detail="Upload a resume before applying")
+        match = calculate_match(job, resume, json.dumps(user["profile"]))
+        application_status = "Shortlisted" if match["match_percentage"] >= 70 else "Applied"
+        existing = db.execute(
+            "SELECT id, status FROM applications WHERE candidate_id = ? AND job_id = ?",
+            (user["id"], job_id),
+        ).fetchone()
+        if existing and existing["status"] != "Withdrawn":
+            raise HTTPException(status_code=409, detail="You have already applied for this role")
+        if existing:
+            db.execute(
+                """UPDATE applications SET resume_id = ?, status = ?, match_percentage = ?,
+                matched_skills_json = ?, missing_skills_json = ?, applied_at = ?
+                WHERE id = ?""",
+                (
+                    resume["id"], application_status, match["match_percentage"],
+                    json.dumps(match["matched_skills"]), json.dumps(match["missing_skills"]),
+                    now(), existing["id"],
+                ),
+            )
+            application_id = existing["id"]
+            record_application_status(db, application_id, application_status, user, "Reapplied after withdrawal")
+        else:
+            cursor = db.execute(
+                """INSERT INTO applications
+                (candidate_id, job_id, resume_id, status, match_percentage, matched_skills_json, missing_skills_json, applied_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    user["id"], job_id, resume["id"], application_status, match["match_percentage"],
+                    json.dumps(match["matched_skills"]), json.dumps(match["missing_skills"]), now(),
+                ),
+            )
+            application_id = cursor.lastrowid
+            record_application_status(db, application_id, application_status, user)
+        notify_user(
+            db, user["id"], "application_submitted", "Application submitted",
+            f"Your application for {job['title']} at {job['company']} was received.",
+            application_id=application_id, email=True,
+        )
+        notify_user(
+            db, job["recruiter_id"], "new_application", "New candidate application",
+            f"A candidate applied for {job['title']} at {job['company']}.",
+            application_id=application_id,
+        )
+        admins = db.execute("SELECT id FROM users WHERE role = 'admin' AND active = 1").fetchall()
+        for admin in admins:
+            add_notification(
+                db, admin["id"], "new_application", "New candidate application",
+                f"A new application was received for {job['title']}.", application_id=application_id,
+            )
+        assessment_for_match(
+            db, application_id, user["id"], job, resume, json.dumps(user["profile"]), match["match_percentage"]
+        )
+        row = db.execute(
+            """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage, a.applied_at, j.title, j.company
+            FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?""",
+            (application_id,),
+        ).fetchone()
+        if application_status == "Shortlisted":
+            notify_user(
+                db, user["id"], "shortlisted", "You have been shortlisted",
+                f"Your application for {job['title']} matched {match['match_percentage']}% of the required skills.",
+                application_id=application_id, email=True,
+            )
+            notify_user(
+                db, job["recruiter_id"], "candidate_shortlisted", "A candidate was shortlisted",
+                f"A candidate for {job['title']} matched {match['match_percentage']}% of the required skills.",
+                application_id=application_id,
+            )
+    if application_status == "Shortlisted":
+        auto_send_assessment_link(application_id)
+        with connect() as db:
+            row = db.execute(
+                """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage, a.applied_at,
+                j.title, j.company FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?""",
+                (application_id,),
+            ).fetchone()
+    return public_application(row)
+
+
+@app.get("/api/applications")
+def list_applications(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    with connect() as db:
+        if user["role"] in {"recruiter", "admin"}:
+            ownership = "AND j.recruiter_id = ?" if user["role"] == "recruiter" else ""
+            params: tuple[int, ...] = (user["id"],) if user["role"] == "recruiter" else ()
+            legacy_ids = db.execute(
+                f"""SELECT a.id FROM applications a JOIN jobs j ON j.id = a.job_id
+                WHERE a.match_percentage IS NULL {ownership}""",
+                params,
+            ).fetchall()
+            for legacy in legacy_ids:
+                application = db.execute(
+                    """SELECT a.id AS application_id, a.candidate_id, a.status, j.*, r.extracted_text,
+                    r.parsed_profile_json, u.profile_json
+                    FROM applications a JOIN jobs j ON j.id = a.job_id
+                    JOIN users u ON u.id = a.candidate_id
+                    LEFT JOIN resumes r ON r.candidate_id = a.candidate_id
+                    WHERE a.id = ?""",
+                    (legacy["id"],),
+                ).fetchone()
+                if application is None or application["parsed_profile_json"] is None:
+                    continue
+                resume = {
+                    "extracted_text": application["extracted_text"] or "",
+                    "parsed_profile_json": application["parsed_profile_json"] or "{}",
+                }
+                match = calculate_match(application, resume, application["profile_json"])
+                status = "Shortlisted" if match["match_percentage"] >= 70 and application["status"] == "Applied" else application["status"]
+                db.execute(
+                    "UPDATE applications SET match_percentage = ?, status = ? WHERE id = ?",
+                    (match["match_percentage"], status, application["id"]),
+                )
+                assessment_for_match(
+                    db,
+                    application["application_id"],
+                    application["candidate_id"],
+                    application,
+                    resume,
+                    application["profile_json"],
+                    match["match_percentage"],
+                )
+            expire_assessment_records(db)
+        if user["role"] == "candidate":
+            rows = db.execute(
+                """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage,
+                a.matched_skills_json, a.missing_skills_json, a.applied_at, j.title, j.company,
+                x.id AS assessment_id,
+                CASE WHEN x.id IS NULL AND a.status = 'Shortlisted' AND a.match_percentage >= 70
+                THEN 'Pending Question Bank' ELSE x.status END AS assessment_status,
+                x.technology AS assessment_topic, x.assessment_name, x.assessment_round,
+                x.total_questions AS assessment_total_questions,
+                x.duration_minutes AS assessment_duration_minutes,
+                x.pass_percentage AS assessment_pass_percentage,
+                x.email_sent_at AS assessment_email_sent_at, x.starts_at AS assessment_started_at,
+                x.submitted_at AS assessment_submitted_at, x.score AS assessment_score,
+                x.score_percentage AS assessment_score_percentage, x.result AS assessment_result,
+                x.correct_answer_count AS assessment_correct_count,
+                x.incorrect_answer_count AS assessment_incorrect_count,
+                (SELECT n.action_url FROM notifications n
+                 WHERE n.related_assessment_id = x.id AND n.user_id = a.candidate_id
+                 AND n.action_url IS NOT NULL AND n.action_url != ''
+                 ORDER BY n.id DESC LIMIT 1) AS assessment_action_url
+                FROM applications a JOIN jobs j ON j.id = a.job_id
+                LEFT JOIN assessments x ON x.application_id = a.id
+                WHERE a.candidate_id = ? ORDER BY a.applied_at DESC""",
+                (user["id"],),
+            ).fetchall()
+        elif user["role"] == "recruiter":
+            rows = db.execute(
+                """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage,
+                a.matched_skills_json, a.missing_skills_json, a.internal_notes, a.applied_at,
+                j.title, j.company, u.name AS candidate_name, u.email AS candidate_email,
+                x.id AS assessment_id,
+                x.status AS assessment_status, x.technology AS assessment_topic,
+                x.assessment_name, x.assessment_round, x.score_percentage AS assessment_score_percentage,
+                x.result AS assessment_result, x.correct_answer_count AS assessment_correct_count,
+                x.incorrect_answer_count AS assessment_incorrect_count,
+                x.email_sent_at AS assessment_email_sent_at, x.score AS assessment_score,
+                x.starts_at AS assessment_started_at, x.submitted_at AS assessment_submitted_at,
+                (SELECT COUNT(*) FROM job_questions q WHERE q.job_id = j.id AND q.active = 1) AS active_question_count
+                FROM applications a JOIN jobs j ON j.id = a.job_id JOIN users u ON u.id = a.candidate_id
+                LEFT JOIN assessments x ON x.application_id = a.id
+                WHERE j.recruiter_id = ? ORDER BY a.applied_at DESC""",
+                (user["id"],),
+            ).fetchall()
+        else:
+            rows = db.execute(
+                """SELECT a.id, a.candidate_id, a.job_id, a.status, a.match_percentage,
+                a.matched_skills_json, a.missing_skills_json, a.applied_at,
+                j.title, j.company, u.name AS candidate_name, u.email AS candidate_email,
+                x.id AS assessment_id,
+                x.status AS assessment_status, x.technology AS assessment_topic,
+                x.assessment_name, x.assessment_round, x.score_percentage AS assessment_score_percentage,
+                x.result AS assessment_result, x.correct_answer_count AS assessment_correct_count,
+                x.incorrect_answer_count AS assessment_incorrect_count,
+                x.email_sent_at AS assessment_email_sent_at, x.score AS assessment_score,
+                x.submitted_at AS assessment_submitted_at
+                FROM applications a JOIN jobs j ON j.id = a.job_id JOIN users u ON u.id = a.candidate_id
+                LEFT JOIN assessments x ON x.application_id = a.id
+                ORDER BY a.applied_at DESC LIMIT 100"""
+            ).fetchall()
+        application_ids = [row["id"] for row in rows]
+        interviews_by_application: dict[int, dict[str, Any]] = {}
+        if application_ids:
+            placeholders = ",".join("?" for _ in application_ids)
+            interview_rows = db.execute(
+                f"""SELECT i.id, i.application_id, i.scheduled_at, i.meeting_platform,
+                i.meeting_url, i.duration_minutes, i.timezone, i.recruiter_message, i.status,
+                i.invitation_sent_at, i.candidate_viewed_at, i.updated_at
+                FROM interviews i
+                WHERE i.id IN (
+                    SELECT MAX(i2.id) FROM interviews i2
+                    WHERE i2.application_id IN ({placeholders}) GROUP BY i2.application_id
+                )""",
+                application_ids,
+            ).fetchall()
+            interviews_by_application = {
+                row["application_id"]: dict(row) for row in interview_rows
+            }
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["matched_skills"] = json.loads(item.pop("matched_skills_json") or "[]")
+        item["missing_skills"] = json.loads(item.pop("missing_skills_json") or "[]")
+        interview = interviews_by_application.get(item["id"])
+        if interview and user["role"] == "candidate" and interview["status"] in {"Cancelled", "Completed"}:
+            interview["meeting_url"] = ""
+        item["interview"] = interview
+        if user["role"] == "candidate":
+            item["assessment_score"] = None
+            item["assessment_score_percentage"] = None
+            item["assessment_correct_count"] = None
+            item["assessment_incorrect_count"] = None
+            item["assessment_result"] = None
+            if item.get("assessment_status") in {"Pending Recruiter Decision", "Completed"}:
+                item["assessment_status"] = "Submitted"
+        items.append(item)
+    return {"items": items}
+
+
+@app.get("/api/applications/{application_id}/history")
+def application_history(
+    application_id: int,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    with connect() as db:
+        scope = """a.id = ? AND (
+            ? = 'admin' OR a.candidate_id = ? OR
+            EXISTS (SELECT 1 FROM jobs j WHERE j.id = a.job_id AND j.recruiter_id = ?)
+        )"""
+        exists = db.execute(
+            f"SELECT 1 FROM applications a WHERE {scope}",
+            (application_id, user["role"], user["id"], user["id"]),
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="Application not found")
+        rows = db.execute(
+            """SELECT h.status, h.actor_role, h.note, h.created_at
+            FROM application_status_history h WHERE h.application_id = ?
+            ORDER BY h.created_at ASC, h.id ASC""",
+            (application_id,),
+        ).fetchall()
+    items = [dict(row) for row in rows]
+    if user["role"] == "candidate":
+        for item in items:
+            item["note"] = ""
+    return {"items": items}
+
+
+@app.patch("/api/applications/{application_id}/notes")
+def update_application_note(
+    application_id: int,
+    body: InternalNoteBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, str]:
+    with connect() as db:
+        owned = db.execute(
+            """SELECT a.id FROM applications a JOIN jobs j ON j.id = a.job_id
+            WHERE a.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+            (application_id, user["role"], user["id"]),
+        ).fetchone()
+        if not owned:
+            raise HTTPException(status_code=404, detail="Application not found for your job listings")
+        db.execute("UPDATE applications SET internal_notes = ? WHERE id = ?", (body.note, application_id))
+    return {"note": body.note}
+
+
+@app.get("/api/applications/{application_id}/ai-summary")
+def get_candidate_ai_summary(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        managed_assessment(db, application_id, user)
+        summary = synthesize_candidate_ai_summary(db, application_id, force_refresh=False)
+    return summary
+
+
+@app.post("/api/applications/{application_id}/ai-summary")
+def generate_candidate_ai_summary_endpoint(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        managed_assessment(db, application_id, user)
+        summary = synthesize_candidate_ai_summary(db, application_id, force_refresh=True)
+    return summary
+
+
+@app.get("/api/notifications")
+def list_notifications(
+    unread: bool = False,
+    limit: int = 50,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if not 1 <= limit <= 100:
+        raise HTTPException(status_code=422, detail="Limit must be between 1 and 100")
+    with connect() as db:
+        where = "user_id = ?" + (" AND is_read = 0" if unread else "")
+        rows = db.execute(
+            f"""SELECT id, type, title, message, related_application_id, related_assessment_id,
+            action_url, is_read, email_delivery_status, created_at
+            FROM notifications WHERE {where} ORDER BY created_at DESC, id DESC LIMIT ?""",
+            (user["id"], limit),
+        ).fetchall()
+        unread_count = db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+            (user["id"],),
+        ).fetchone()[0]
+    return {"items": [dict(row) for row in rows], "unread_count": unread_count}
+
+
+@app.get("/api/notifications/unread-count")
+def notification_unread_count(user: dict[str, Any] = Depends(current_user)) -> dict[str, int]:
+    with connect() as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ? AND is_read = 0",
+            (user["id"],),
+        ).fetchone()[0]
+    return {"unread_count": count}
+
+
+@app.patch("/api/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: int,
+    body: NotificationReadBody,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    with connect() as db:
+        result = db.execute(
+            "UPDATE notifications SET is_read = ? WHERE id = ? AND user_id = ?",
+            (int(body.is_read), notification_id, user["id"]),
+        )
+        if not result.rowcount:
+            raise HTTPException(status_code=404, detail="Notification not found")
+    return {"id": notification_id, "is_read": body.is_read}
+
+
+@app.patch("/api/notifications/read-all")
+def mark_all_notifications_read(user: dict[str, Any] = Depends(current_user)) -> dict[str, int]:
+    with connect() as db:
+        updated = db.execute(
+            "UPDATE notifications SET is_read = 1 WHERE user_id = ? AND is_read = 0",
+            (user["id"],),
+        ).rowcount
+    return {"updated": updated}
+
+
+def assessment_delivery(
+    recipient: str,
+    job_title: str,
+    company: str,
+    technology: str,
+    expires_at: str,
+    assessment_url: str,
+) -> str:
+    smtp_host = os.environ.get("SKILLSPHERE_SMTP_HOST", "")
+    if not smtp_host:
+        if IS_PRODUCTION:
+            raise HTTPException(status_code=503, detail="Assessment email is not configured on this server")
+        logger.warning("Development assessment email for %s: %s", recipient, assessment_url)
+        return "development"
+
+    sender = os.environ.get("SKILLSPHERE_SMTP_FROM") or os.environ.get("SKILLSPHERE_SMTP_USERNAME")
+    username = os.environ.get("SKILLSPHERE_SMTP_USERNAME", "")
+    password = os.environ.get("SKILLSPHERE_SMTP_PASSWORD", "")
+    if not sender or (username and not password):
+        raise HTTPException(status_code=503, detail="SMTP sender or credentials are incomplete")
+    if IS_PRODUCTION and not os.environ.get("SKILLSPHERE_PUBLIC_BASE_URL"):
+        raise HTTPException(status_code=503, detail="Set SKILLSPHERE_PUBLIC_BASE_URL before sending assessment links")
+
+    message = EmailMessage()
+    message["Subject"] = f"Technical assessment: {job_title}"
+    message["From"] = sender
+    message["To"] = recipient
+    expiry_label = datetime.fromisoformat(expires_at).astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    message.set_content(
+        f"""You have been shortlisted for {job_title} at {company}.
+
+Please complete this 20-question {technology} assessment. You will have
+{ASSESSMENT_DURATION_MINUTES} minutes after starting, and this link expires
+on {expiry_label}.
+
+Start your assessment: {assessment_url}
+
+The assessment is individual and can only be submitted once.
+"""
+    )
+    port = int(os.environ.get("SKILLSPHERE_SMTP_PORT", "587"))
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(smtp_host, port, timeout=20) as server:
+                if username:
+                    server.login(username, password)
+                server.send_message(message)
+        else:
+            with smtplib.SMTP(smtp_host, port, timeout=20) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                if username:
+                    server.login(username, password)
+                server.send_message(message)
+    except (OSError, smtplib.SMTPException) as error:
+        logger.exception("Could not send technical assessment email")
+        raise HTTPException(status_code=502, detail="Could not send the assessment email") from error
+    return "email"
+
+
+def managed_assessment(
+    db: sqlite3.Connection,
+    application_id: int,
+    user: dict[str, Any],
+) -> sqlite3.Row:
+    row = db.execute(
+        """SELECT a.id AS application_id, a.candidate_id, a.job_id, a.status AS application_status,
+        a.match_percentage, u.email AS candidate_email, j.title, j.company,
+        j.recruiter_id AS owner_id, j.assessment_question_count, j.allow_detailed_results,
+        x.id AS assessment_id, x.technology, x.question_topics_json,
+        x.question_topic_weights_json,
+        x.status AS assessment_status,
+        x.email_sent_at, x.score, x.submitted_at
+        FROM applications a JOIN users u ON u.id = a.candidate_id
+        JOIN jobs j ON j.id = a.job_id
+        LEFT JOIN assessments x ON x.application_id = a.id
+        WHERE a.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+        (application_id, user["role"], user["id"]),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Application not found for your job listings")
+    return row
+
+
+def create_assessment_if_ready(db: sqlite3.Connection, application_id: int) -> None:
+    application = db.execute(
+        """SELECT a.id AS application_id, a.candidate_id, a.status, a.match_percentage, a.job_id,
+        j.*, r.extracted_text, r.parsed_profile_json, u.profile_json
+        FROM applications a JOIN jobs j ON j.id = a.job_id
+        JOIN users u ON u.id = a.candidate_id
+        LEFT JOIN resumes r ON r.candidate_id = a.candidate_id
+        WHERE a.id = ?""",
+        (application_id,),
+    ).fetchone()
+    if not application or application["match_percentage"] is None or application["parsed_profile_json"] is None:
+        return
+    resume = {
+        "extracted_text": application["extracted_text"] or "",
+        "parsed_profile_json": application["parsed_profile_json"] or "{}",
+    }
+    assessment_for_match(
+        db, application["application_id"], application["candidate_id"],
+        application, resume, application["profile_json"], application["match_percentage"],
+    )
+
+
+def notify_assessment_expired(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    recruiter = db.execute("SELECT recruiter_id FROM jobs WHERE id = ?", (row["job_id"],)).fetchone()
+    for recipient in (row["candidate_id"], recruiter["recruiter_id"] if recruiter else None):
+        if recipient:
+            add_notification(
+                db, recipient, "assessment_expired", "Assessment link expired",
+                f"The technical assessment for {row['title']} expired.",
+                application_id=row["application_id"], assessment_id=row["id"],
+            )
+
+
+def expire_assessment_records(db: sqlite3.Connection) -> None:
+    expiring = db.execute(
+        """SELECT x.id, x.candidate_id, x.application_id, x.job_id, x.status,
+        x.expires_at, j.title, j.recruiter_id
+        FROM assessments x JOIN jobs j ON j.id = x.job_id
+        WHERE x.status IN ('Sent', 'Started') AND x.expires_at <= ?""",
+        (now(),),
+    ).fetchall()
+    for assessment in expiring:
+        updated = db.execute(
+            """UPDATE assessments SET status = 'Expired', token_hash = NULL
+            WHERE id = ? AND status IN ('Sent', 'Started')""",
+            (assessment["id"],),
+        ).rowcount
+        if not updated:
+            continue
+        application = db.execute(
+            "SELECT status FROM applications WHERE id = ?", (assessment["application_id"],)
+        ).fetchone()
+        if application and application["status"] in {"Assessment Sent", "Assessment Started"}:
+            db.execute(
+                "UPDATE applications SET status = 'Assessment Expired' WHERE id = ?",
+                (assessment["application_id"],),
+            )
+            record_application_status(
+                db, assessment["application_id"], "Assessment Expired",
+                {"id": None, "role": "system"},
+            )
+        notify_assessment_expired(db, assessment)
+
+
+def issue_assessment_link(
+    db: sqlite3.Connection,
+    managed: sqlite3.Row,
+    *,
+    reissue: bool,
+) -> dict[str, Any]:
+    if managed["application_status"] in {"Withdrawn", "Rejected", "Accepted", "Selected"}:
+        raise HTTPException(status_code=409, detail="This application is no longer eligible for an assessment")
+    if managed["match_percentage"] is None or managed["match_percentage"] < 70:
+        raise HTTPException(status_code=409, detail="Only candidates with a match of 70% or higher are eligible")
+    if not managed["assessment_id"]:
+        raise HTTPException(status_code=409, detail="Assessment data is unavailable for this application")
+    if not managed["technology"]:
+        raise HTTPException(status_code=409, detail="Select an assessment topic before sending the assessment")
+    allowed = {"Sent", "Expired"} if reissue else {"Not Sent"}
+    if managed["assessment_status"] not in allowed:
+        if reissue:
+            raise HTTPException(status_code=409, detail="Only sent or expired assessments can be reissued")
+        raise HTTPException(status_code=409, detail="Use reissue for an assessment that has already been sent")
+
+    target_count = (
+        managed["assessment_question_count"]
+        if ("assessment_question_count" in managed.keys() and managed["assessment_question_count"])
+        else 20
+    )
+    allow_detailed = (
+        managed["allow_detailed_results"]
+        if ("allow_detailed_results" in managed.keys() and managed["allow_detailed_results"] is not None)
+        else 1
+    )
+    topics = json.loads(managed["question_topics_json"] or "[]")
+    if not topics:
+        topics = [managed["technology"]]
+    normalized_topics = {topic.casefold(): topic for topic in topics}
+    stored_weights = json.loads(managed["question_topic_weights_json"] or "{}")
+    topic_weights = {
+        topic: max(1, int(stored_weights.get(topic, 1)))
+        for topic in normalized_topics.values()
+    }
+    placeholders = ",".join("?" for _ in topics)
+    questions = db.execute(
+        f"""SELECT id, technology, question, options_json, correct_index, difficulty,
+        explanation, learning_resource_url, subtopic FROM job_questions
+        WHERE job_id = ? AND lower(technology) IN ({placeholders}) AND active = 1""",
+        (managed["job_id"], *(topic.casefold() for topic in topics)),
+    ).fetchall()
+    selected = relevant_balanced_question_sample(questions, topic_weights, target_count)
+    if len(selected) != target_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"The selected question topics need at least {target_count} active questions in total.",
+        )
+    token = secrets.token_urlsafe(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    created = datetime.now(timezone.utc)
+    expires_at = (created.timestamp() + ASSESSMENT_TTL_HOURS * 3600)
+    expiry = datetime.fromtimestamp(expires_at, timezone.utc).isoformat()
+    assessment_url = f"{PUBLIC_BASE_URL}/?{urlencode({'assessment': token})}"
+    delivery = assessment_delivery(
+        managed["candidate_email"], managed["title"], managed["company"], managed["technology"], expiry, assessment_url
+    )
+
+    db.execute("DELETE FROM assessment_questions WHERE assessment_id = ?", (managed["assessment_id"],))
+    db.execute(
+        "DELETE FROM assessment_proctoring_events WHERE assessment_id = ?",
+        (managed["assessment_id"],),
+    )
+    for order, question in enumerate(selected, start=1):
+        options = json.loads(question["options_json"])
+        correct_option = options[question["correct_index"]]
+        random.SystemRandom().shuffle(options)
+        db.execute(
+            """INSERT OR IGNORE INTO technical_questions
+            (technology, question, options_json, correct_index, difficulty, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                question["technology"], question["question"], question["options_json"],
+                question["correct_index"], question["difficulty"].lower(), now(),
+            ),
+        )
+        application = db.execute(
+            "SELECT status FROM applications WHERE id = ?", (managed["application_id"],)
+        ).fetchone()
+        if application and application["status"] != "Assessment Sent":
+            db.execute(
+                "UPDATE applications SET status = 'Assessment Sent' WHERE id = ?",
+                (managed["application_id"],),
+            )
+            record_application_status(
+                db, managed["application_id"], "Assessment Sent",
+                {"id": managed["owner_id"], "role": "recruiter"},
+            )
+        legacy_question = db.execute(
+            "SELECT id FROM technical_questions WHERE technology = ? AND question = ?",
+            (question["technology"], question["question"]),
+        ).fetchone()
+        db.execute(
+            """INSERT INTO assessment_questions
+            (assessment_id, question_id, question_order, question_snapshot, options_snapshot, correct_index, technology, difficulty, explanation, learning_resource_url, subtopic)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                managed["assessment_id"], legacy_question["id"], order, question["question"],
+                json.dumps(options), options.index(correct_option),
+                question["technology"], question["difficulty"],
+                question["explanation"] if "explanation" in question.keys() else "",
+                question["learning_resource_url"] if "learning_resource_url" in question.keys() else "",
+                question["subtopic"] if "subtopic" in question.keys() else "",
+            ),
+        )
+    db.execute(
+        """UPDATE assessments SET token_hash = ?, status = 'Sent', starts_at = NULL,
+        expires_at = ?, submitted_at = NULL, score = NULL, total_questions = ?,
+        assessment_name = ?, assessment_round = 'Round 1', pass_percentage = ?,
+        score_percentage = NULL, correct_answer_count = NULL, incorrect_answer_count = NULL,
+        result = NULL, result_processed_at = NULL, time_taken_seconds = NULL,
+        duration_minutes = ?, email_sent_at = ?, proctoring_required = ?,
+        proctoring_consent_at = NULL, camera_permission_granted_at = NULL,
+        proctoring_started_at = NULL, proctoring_warning_count = 0,
+        proctoring_flagged_at = NULL, detailed_results_visible = ?
+        WHERE id = ?""",
+        (
+            token_hash, expiry, target_count, ROUND1_ASSESSMENT_NAME, ROUND1_PASS_PERCENTAGE,
+            ASSESSMENT_DURATION_MINUTES,
+            now() if delivery == "email" else None,
+            int(PROCTORING_REQUIRED),
+            int(bool(allow_detailed)),
+            managed["assessment_id"],
+        ),
+    )
+    add_notification(
+        db,
+        managed["candidate_id"],
+        "assessment_sent",
+        "Your assessment is ready",
+        f"Your {managed['technology']} assessment for {managed['title']} is available. The secure link was sent to your registered email.",
+        application_id=managed["application_id"],
+        assessment_id=managed["assessment_id"],
+        action_url=assessment_url,
+        email_delivery_status="Sent" if delivery == "email" else "Development",
+    )
+    add_notification(
+        db, managed["owner_id"], "assessment_sent", "Assessment link sent",
+        f"A {managed['technology']} assessment link was sent to {managed['candidate_email']} for {managed['title']}.",
+        application_id=managed["application_id"], assessment_id=managed["assessment_id"],
+        email_delivery_status="Sent" if delivery == "email" else "Development",
+    )
+    return {
+        "status": "Sent",
+        "delivery": delivery,
+    }
+
+
+def auto_send_assessment_link(application_id: int) -> None:
+    try:
+        with connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            create_assessment_if_ready(db, application_id)
+            recruiter = db.execute(
+                """SELECT j.recruiter_id FROM applications a JOIN jobs j ON j.id = a.job_id
+                WHERE a.id = ?""",
+                (application_id,),
+            ).fetchone()
+            if not recruiter:
+                return
+            owner = {"id": recruiter["recruiter_id"], "role": "recruiter"}
+            managed = managed_assessment(db, application_id, owner)
+            if not managed["assessment_id"] or not managed["technology"] or managed["assessment_status"] != "Not Sent":
+                return
+            issue_assessment_link(db, managed, reissue=False)
+    except HTTPException as error:
+        logger.error("Could not automatically deliver assessment for application %s: %s", application_id, error.detail)
+        with connect() as db:
+            application = db.execute(
+                """SELECT a.candidate_id, j.recruiter_id, j.title FROM applications a
+                JOIN jobs j ON j.id = a.job_id WHERE a.id = ?""",
+                (application_id,),
+            ).fetchone()
+            if application:
+                for recipient, role in (
+                    (application["candidate_id"], "candidate"),
+                    (application["recruiter_id"], "recruiter"),
+                ):
+                    add_notification(
+                        db, recipient, "assessment_delivery_failed", "Assessment link could not be sent",
+                        f"The assessment for {application['title']} could not be emailed. Ask an administrator to check email settings.",
+                        application_id=application_id,
+                    )
+
+
+def auto_send_ready_assessments(job_id: int) -> None:
+    with connect() as db:
+        applications = db.execute(
+            """SELECT id FROM applications WHERE job_id = ?
+            AND status = 'Shortlisted' AND match_percentage >= 70 ORDER BY applied_at, id""",
+            (job_id,),
+        ).fetchall()
+    for application in applications:
+        auto_send_assessment_link(application["id"])
+
+
+@app.post("/api/applications/{application_id}/assessment/send")
+def send_assessment(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        managed_assessment(db, application_id, user)
+        create_assessment_if_ready(db, application_id)
+        managed = managed_assessment(db, application_id, user)
+        if not managed["assessment_id"]:
+            summary = job_question_summary(db, managed["job_id"])
+            if not summary["ready"]:
+                target_q = summary.get("configured_question_count", 20)
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"A job-specific question bank needs at least {target_q} active questions. "
+                        f"Add {summary['additional_needed']} more active questions."
+                    ),
+                )
+        result = issue_assessment_link(db, managed, reissue=False)
+    return result
+
+
+@app.post("/api/applications/{application_id}/assessment/reissue")
+def reissue_assessment(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        managed = managed_assessment(db, application_id, user)
+        result = issue_assessment_link(db, managed, reissue=True)
+    return result
+
+
+@app.get("/api/assessments")
+def assessment_dashboard(
+    status: str | None = None,
+    technology: str | None = None,
+    job_id: int | None = None,
+    candidate: str | None = None,
+    result: str | None = None,
+    min_score: float | None = None,
+    max_score: float | None = None,
+    completed_from: date | None = None,
+    completed_to: date | None = None,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    conditions = []
+    params: list[Any] = []
+    if user["role"] == "candidate":
+        conditions.append("x.candidate_id = ?")
+        params.append(user["id"])
+    elif user["role"] == "recruiter":
+        conditions.append("j.recruiter_id = ?")
+        params.append(user["id"])
+    if status:
+        conditions.append("x.status = ?")
+        params.append(status)
+    if technology:
+        conditions.append("x.technology = ?")
+        params.append(technology)
+    if job_id:
+        conditions.append("x.job_id = ?")
+        params.append(job_id)
+    if candidate and user["role"] in {"recruiter", "admin"}:
+        conditions.append("(u.name LIKE ? OR u.email LIKE ?)")
+        params.extend([f"%{candidate}%", f"%{candidate}%"])
+    if result:
+        if result not in {"Passed", "Failed"}:
+            raise HTTPException(status_code=422, detail="Choose Passed or Failed for result")
+        conditions.append("x.result = ?")
+        params.append(result)
+    if min_score is not None:
+        if not 0 <= min_score <= 100:
+            raise HTTPException(status_code=422, detail="Minimum score must be between 0 and 100")
+        conditions.append("x.score_percentage >= ?")
+        params.append(min_score)
+    if max_score is not None:
+        if not 0 <= max_score <= 100:
+            raise HTTPException(status_code=422, detail="Maximum score must be between 0 and 100")
+        conditions.append("x.score_percentage <= ?")
+        params.append(max_score)
+    if min_score is not None and max_score is not None and min_score > max_score:
+        raise HTTPException(status_code=422, detail="Minimum score cannot exceed maximum score")
+    if completed_from:
+        conditions.append("x.submitted_at >= ?")
+        params.append(datetime.combine(completed_from, datetime.min.time(), timezone.utc).isoformat())
+    if completed_to:
+        conditions.append("x.submitted_at < ?")
+        params.append(datetime.combine(completed_to + timedelta(days=1), datetime.min.time(), timezone.utc).isoformat())
+    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    with connect() as db:
+        expire_assessment_records(db)
+        rows = db.execute(
+            f"""SELECT x.id, x.application_id, x.candidate_id, x.job_id, x.technology,
+            x.assessment_name, x.assessment_round, x.pass_percentage, x.score_percentage,
+            x.correct_answer_count, x.incorrect_answer_count, x.result, x.result_processed_at,
+            x.time_taken_seconds,
+            x.question_topics_json, x.selection_reasoning,
+            x.status AS assessment_status, x.match_percentage, x.starts_at, x.expires_at,
+            x.submitted_at, x.score, x.total_questions, x.duration_minutes,
+            x.email_sent_at, j.title, j.company, a.status AS application_status,
+            u.name AS candidate_name, u.email AS candidate_email,
+            (SELECT COUNT(*) FROM assessment_questions q
+             WHERE q.assessment_id = x.id AND q.selected_answer IS NOT NULL) AS answered_count,
+            (SELECT n.action_url FROM notifications n
+             WHERE n.related_assessment_id = x.id AND n.user_id = x.candidate_id
+             AND n.action_url IS NOT NULL AND n.action_url != ''
+             ORDER BY n.id DESC LIMIT 1) AS action_url
+            FROM assessments x JOIN jobs j ON j.id = x.job_id
+            JOIN applications a ON a.id = x.application_id
+            JOIN users u ON u.id = x.candidate_id {where}
+            ORDER BY x.created_at DESC, x.id DESC""",
+            tuple(params),
+        ).fetchall()
+    items = []
+    for row in rows:
+        item = dict(row)
+        if user["role"] == "candidate":
+            item.pop("question_topics_json", None)
+            item.pop("selection_reasoning", None)
+            item["score"] = None
+            item["score_percentage"] = None
+            item["correct_answer_count"] = None
+            item["incorrect_answer_count"] = None
+            item["result"] = None
+            item["pass_percentage"] = None
+            if item.get("assessment_status") in {"Pending Recruiter Decision", "Completed"}:
+                item["assessment_status"] = "Submitted"
+        else:
+            item.pop("action_url", None)
+        item["score_percentage"] = (
+            item["score_percentage"]
+            if item["score_percentage"] is not None
+            else round(item["score"] / item["total_questions"] * 100, 2)
+            if item["score"] is not None and item["total_questions"] else None
+        )
+        if item["time_taken_seconds"] is None and item["starts_at"] and item["submitted_at"]:
+            item["time_taken_seconds"] = max(
+                0,
+                int((datetime.fromisoformat(item["submitted_at"]) - datetime.fromisoformat(item["starts_at"])).total_seconds()),
+            )
+        items.append(item)
+    return {"items": items}
+
+
+@app.get("/api/assessment-reviews/{assessment_id}")
+def assessment_review(
+    assessment_id: int,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if user["role"] == "candidate":
+        raise HTTPException(
+            status_code=403,
+            detail="Assessment results are confidential and under recruiter review",
+        )
+    with connect() as db:
+        if user["role"] == "recruiter":
+            conditions = "x.id = ? AND j.recruiter_id = ?"
+            params: tuple[Any, ...] = (assessment_id, user["id"])
+        else:
+            conditions = "x.id = ?"
+            params = (assessment_id,)
+        row = db.execute(
+            f"""SELECT x.id, x.application_id, x.candidate_id, x.technology, x.status, x.match_percentage,
+            x.assessment_name, x.assessment_round, x.pass_percentage,
+            x.starts_at, x.expires_at, x.submitted_at, x.score, x.score_percentage,
+            x.total_questions, x.correct_answer_count, x.incorrect_answer_count, x.result,
+            x.result_processed_at, x.time_taken_seconds, a.status AS application_status,
+            x.duration_minutes, x.detailed_results_visible,
+            x.recruiter_decision, x.recruiter_decision_at, x.recruiter_decision_by, x.recruiter_decision_notes,
+            j.title, j.company, j.allow_detailed_results,
+            u.name AS candidate_name, u.email AS candidate_email
+            FROM assessments x JOIN jobs j ON j.id = x.job_id
+            JOIN users u ON u.id = x.candidate_id
+            JOIN applications a ON a.id = x.application_id WHERE {conditions}""",
+            params,
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Assessment not found or access denied")
+        if row["status"] not in {"Completed", "Pending Recruiter Decision"} or not row["submitted_at"]:
+            raise HTTPException(status_code=409, detail="Question-by-question review is available after submission")
+        questions = db.execute(
+            """SELECT q.question_order, q.question_snapshot, q.options_snapshot,
+            q.selected_answer, q.correct_index, q.is_correct,
+            q.technology, q.difficulty, q.explanation, q.learning_resource_url, q.subtopic
+            FROM assessment_questions q WHERE q.assessment_id = ? ORDER BY q.question_order""",
+            (assessment_id,),
+        ).fetchall()
+        rec_row = db.execute(
+            """SELECT recording_status, duration_seconds, format, uploaded_at
+            FROM assessment_recordings WHERE assessment_id = ? ORDER BY id DESC LIMIT 1""",
+            (assessment_id,),
+        ).fetchone()
+
+    can_view_detailed = (
+        user["role"] in {"recruiter", "admin"}
+        or bool(
+            row["detailed_results_visible"]
+            if row["detailed_results_visible"] is not None
+            else row["allow_detailed_results"]
+        )
+    )
+
+    topic_stats: dict[str, dict[str, int]] = {}
+    diff_stats: dict[str, dict[str, int]] = {
+        "Easy": {"total": 0, "correct": 0},
+        "Medium": {"total": 0, "correct": 0},
+        "Hard": {"total": 0, "correct": 0},
+    }
+    for q in questions:
+        tech = q["technology"] or row["technology"] or "General"
+        diff = q["difficulty"] or "Medium"
+        if diff not in diff_stats:
+            diff_stats[diff] = {"total": 0, "correct": 0}
+        corr = int(bool(q["is_correct"]))
+        topic_stats.setdefault(tech, {"total": 0, "correct": 0})
+        topic_stats[tech]["total"] += 1
+        topic_stats[tech]["correct"] += corr
+        diff_stats[diff]["total"] += 1
+        diff_stats[diff]["correct"] += corr
+
+    topic_breakdown = [
+        {
+            "technology": tech,
+            "total": stats["total"],
+            "correct": stats["correct"],
+            "percentage": round(stats["correct"] * 100.0 / stats["total"], 1) if stats["total"] else 0.0,
+        }
+        for tech, stats in topic_stats.items()
+    ]
+    difficulty_breakdown = {
+        diff: {
+            "total": stats["total"],
+            "correct": stats["correct"],
+            "percentage": round(stats["correct"] * 100.0 / stats["total"], 1) if stats["total"] else 0.0,
+        }
+        for diff, stats in diff_stats.items()
+    }
+
+    strengths = [item["technology"] for item in topic_breakdown if item["percentage"] >= 70.0]
+    areas_to_improve = [item["technology"] for item in topic_breakdown if item["percentage"] < 70.0]
+
+    recommendations: list[str] = []
+    for weak in areas_to_improve:
+        w_low = weak.lower()
+        if "sql" in w_low:
+            recommendations.append("Practice SQL queries, joins, aggregations, window functions, and GROUP BY / HAVING clauses.")
+        elif "python" in w_low:
+            recommendations.append("Review Python data cleaning, pandas manipulation, list/dict comprehensions, and OOP principles.")
+        elif "react" in w_low or "javascript" in w_low:
+            recommendations.append("Strengthen JavaScript ES6+ features, asynchronous async/await patterns, and React state/lifecycle management.")
+        elif "java" in w_low:
+            recommendations.append("Review Java OOP concepts, collections framework, exception handling, and multithreading basics.")
+        elif "tableau" in w_low or "bi" in w_low:
+            recommendations.append("Practice data visualization principles, calculated fields, dashboard actions, and level-of-detail (LOD) expressions.")
+        else:
+            recommendations.append(f"Focus on core concepts, problem-solving, and hands-on exercises in {weak}.")
+
+    if not recommendations:
+        recommendations.append("Outstanding performance across all evaluated topics! Continue building advanced projects to maintain your edge.")
+
+    details = []
+    for question in questions:
+        options = json.loads(question["options_snapshot"])
+        is_corr = bool(question["is_correct"]) if question["is_correct"] is not None else None
+        hide_details = (user["role"] == "candidate" and not can_view_detailed)
+        details.append({
+            "order": question["question_order"],
+            "question": question["question_snapshot"],
+            "options": options,
+            "selected_answer": question["selected_answer"],
+            "correct_answer": None if hide_details else question["correct_index"],
+            "is_correct": is_corr,
+            "technology": question["technology"] or row["technology"] or "General",
+            "difficulty": question["difficulty"] or "Medium",
+            "explanation": "" if hide_details else (question["explanation"] or ""),
+            "learning_resource_url": "" if hide_details else (question["learning_resource_url"] or ""),
+            "subtopic": question["subtopic"] or "",
+        })
+
+    return {
+        **dict(row),
+        "can_view_detailed_answers": can_view_detailed,
+        "recording_status": rec_row["recording_status"] if rec_row else (row["recording_status"] if "recording_status" in row.keys() else "Pending"),
+        "recording_captured": bool(rec_row and rec_row["recording_status"] == "Uploaded"),
+        "recording_duration_seconds": rec_row["duration_seconds"] if rec_row else None,
+        "strengths": strengths,
+        "areas_to_improve": areas_to_improve,
+        "topic_breakdown": topic_breakdown,
+        "difficulty_breakdown": difficulty_breakdown,
+        "recommendations": recommendations,
+        "questions": details,
+    }
+
+
+@app.post("/api/assessments/{assessment_id}/decision")
+def make_assessment_decision(
+    assessment_id: int,
+    body: AssessmentDecisionBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        if user["role"] == "recruiter":
+            row = db.execute(
+                """SELECT x.id, x.application_id, x.candidate_id, x.job_id, x.status,
+                x.submitted_at, x.result, x.score_percentage, x.correct_answer_count,
+                x.total_questions, x.pass_percentage, j.title, j.company,
+                u.name AS candidate_name
+                FROM assessments x
+                JOIN jobs j ON j.id = x.job_id
+                JOIN users u ON u.id = x.candidate_id
+                WHERE x.id = ? AND j.recruiter_id = ?""",
+                (assessment_id, user["id"]),
+            ).fetchone()
+        else:
+            row = db.execute(
+                """SELECT x.id, x.application_id, x.candidate_id, x.job_id, x.status,
+                x.submitted_at, x.result, x.score_percentage, x.correct_answer_count,
+                x.total_questions, x.pass_percentage, j.title, j.company,
+                u.name AS candidate_name
+                FROM assessments x
+                JOIN jobs j ON j.id = x.job_id
+                JOIN users u ON u.id = x.candidate_id
+                WHERE x.id = ?""",
+                (assessment_id,),
+            ).fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="Assessment not found or access denied")
+        if not row["submitted_at"] and row["status"] not in {"Pending Recruiter Decision", "Completed"}:
+            raise HTTPException(status_code=400, detail="Cannot make decision on unsubmitted assessment")
+
+        decision_val = "Passed" if body.decision == "Pass" else "Failed"
+        decided_at = now()
+        new_app_status = f"Round 1 {decision_val}"
+
+        db.execute(
+            """UPDATE assessments SET recruiter_decision = ?, recruiter_decision_at = ?,
+            recruiter_decision_by = ?, recruiter_decision_notes = ?, status = 'Completed'
+            WHERE id = ?""",
+            (decision_val, decided_at, user["id"], body.notes.strip(), assessment_id),
+        )
+        db.execute(
+            "UPDATE applications SET status = ? WHERE id = ?",
+            (new_app_status, row["application_id"]),
+        )
+        history_note = f"Recruiter manual decision: {decision_val}"
+        if body.notes.strip():
+            history_note += f" - {body.notes.strip()}"
+        record_application_status(
+            db, row["application_id"], new_app_status, user, history_note,
+        )
+        notify_user(
+            db, row["candidate_id"], "application_status_updated",
+            f"Application status updated: {row['title']}",
+            f"Your application status for {row['title']} has been updated to {new_app_status}.",
+            application_id=row["application_id"], assessment_id=row["id"], email=True,
+        )
+
+    return {
+        "assessment_id": assessment_id,
+        "application_id": row["application_id"],
+        "recruiter_decision": decision_val,
+        "recruiter_decision_at": decided_at,
+        "recruiter_decision_by": user["id"],
+        "application_status": new_app_status,
+        "message": f"Candidate successfully marked as {decision_val}.",
+    }
+
+
+@app.get("/api/candidate/analytics")
+def candidate_analytics(user: dict[str, Any] = Depends(require_role("candidate"))) -> dict[str, Any]:
+    with connect() as db:
+        applications = db.execute(
+            """SELECT a.id, a.status, a.match_percentage, a.applied_at, j.title, j.company
+            FROM applications a JOIN jobs j ON j.id = a.job_id
+            WHERE a.candidate_id = ? ORDER BY a.applied_at DESC""",
+            (user["id"],),
+        ).fetchall()
+
+        status_counts: dict[str, int] = {}
+        for app_row in applications:
+            status_counts[app_row["status"]] = status_counts.get(app_row["status"], 0) + 1
+
+        interviews_count = db.execute(
+            """SELECT COUNT(*) FROM interviews i
+            JOIN applications a ON a.id = i.application_id
+            WHERE a.candidate_id = ?""",
+            (user["id"],),
+        ).fetchone()[0]
+
+        completed_assessments = db.execute(
+            """SELECT x.id, x.score, x.total_questions, x.score_percentage, x.result,
+            x.technology, x.submitted_at, j.title
+            FROM assessments x JOIN jobs j ON j.id = x.job_id
+            WHERE x.candidate_id = ? AND x.status IN ('Completed', 'Pending Recruiter Decision')
+            ORDER BY x.submitted_at DESC""",
+            (user["id"],),
+        ).fetchall()
+
+        return {
+            "total_applications": len(applications),
+            "active_applications": sum(1 for a in applications if a["status"] not in ("Rejected", "Withdrawn", "Accepted", "Selected")),
+            "interviews_scheduled": interviews_count,
+            "assessments_completed": len(completed_assessments),
+            "average_score_percentage": None,
+            "applications_by_status": status_counts,
+            "strengths": [],
+            "areas_to_improve": [],
+            "recent_assessments": [
+                {
+                    "id": a["id"],
+                    "technology": a["technology"],
+                    "submitted_at": a["submitted_at"],
+                    "title": a["title"],
+                }
+                for a in completed_assessments[:5]
+            ],
+        }
+
+
+@app.get("/api/recruiter/analytics")
+def recruiter_analytics(
+    report_range: str = "this_week",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())
+    if report_range == "this_week":
+        start, end = monday, monday + timedelta(days=7)
+    elif report_range == "last_week":
+        start, end = monday - timedelta(days=7), monday
+    elif report_range == "this_month":
+        start = today.replace(day=1)
+        next_month = (start + timedelta(days=32)).replace(day=1)
+        end = next_month
+    elif report_range == "last_month":
+        this_month_start = today.replace(day=1)
+        end = this_month_start
+        start = (this_month_start - timedelta(days=1)).replace(day=1)
+    elif report_range == "all":
+        start = date(2020, 1, 1)
+        end = today + timedelta(days=1)
+    elif report_range == "custom":
+        try:
+            start = date.fromisoformat(start_date or "")
+            end = date.fromisoformat(end_date or "") + timedelta(days=1)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Custom reports need valid start_date and end_date values") from error
+        if end <= start:
+            raise HTTPException(status_code=422, detail="end_date must be on or after start_date")
+    else:
+        raise HTTPException(status_code=422, detail="Choose this_week, last_week, this_month, last_month, all, or custom")
+
+    range_start = datetime.combine(start, datetime.min.time(), timezone.utc).isoformat()
+    range_end = datetime.combine(end, datetime.min.time(), timezone.utc).isoformat()
+
+    with connect() as db:
+        job_condition = "1=1" if user["role"] == "admin" else "j.recruiter_id = ?"
+        job_params = () if user["role"] == "admin" else (user["id"],)
+
+        jobs = db.execute(
+            f"SELECT id, title, company, status, assessment_question_count, allow_detailed_results, skills_json FROM jobs j WHERE {job_condition}",
+            job_params,
+        ).fetchall()
+        job_ids = [j["id"] for j in jobs]
+
+        if not job_ids:
+            return {
+                "range": report_range,
+                "start_date": start.isoformat(),
+                "end_date": (end - timedelta(days=1)).isoformat(),
+                "summary": {"total_jobs": 0, "total_applications": 0, "assessments_completed": 0, "interviews_scheduled": 0, "accepted": 0},
+                "conversion_funnel": [],
+                "jobs_breakdown": [],
+                "top_skills": [],
+                "question_bank_readiness": {"ready_jobs": 0, "incomplete_jobs": 0},
+            }
+
+        placeholders = ",".join("?" for _ in job_ids)
+
+        apps = db.execute(
+            f"""SELECT a.id, a.job_id, a.status, a.match_percentage, a.applied_at
+            FROM applications a WHERE a.job_id IN ({placeholders})
+            AND a.applied_at >= ? AND a.applied_at < ?""",
+            (*job_ids, range_start, range_end),
+        ).fetchall()
+
+        all_apps = db.execute(
+            f"""SELECT a.id, a.job_id, a.status, a.match_percentage
+            FROM applications a WHERE a.job_id IN ({placeholders})""",
+            tuple(job_ids),
+        ).fetchall()
+
+        funnel_stages = [
+            ("Applied", lambda s: True),
+            ("Under Review", lambda s: s not in ("Applied",)),
+            ("Shortlisted", lambda s: s in ("Shortlisted", "Assessment Sent", "Assessment Started", "Assessment Completed", "Round 1 Passed", "Round 1 Failed", "Interview", "Accepted", "Selected")),
+            ("Assessment Completed", lambda s: s in ("Assessment Completed", "Round 1 Passed", "Round 1 Failed", "Interview", "Accepted", "Selected")),
+            ("Round 1 Passed", lambda s: s in ("Round 1 Passed", "Interview", "Accepted", "Selected")),
+            ("Interview", lambda s: s in ("Interview", "Accepted", "Selected")),
+            ("Accepted", lambda s: s in ("Accepted", "Selected")),
+        ]
+        total_applied = len(all_apps)
+        funnel = []
+        for stage_name, matcher in funnel_stages:
+            count = sum(1 for a in all_apps if matcher(a["status"]))
+            pct = round((count / total_applied * 100), 1) if total_applied > 0 else 0.0
+            funnel.append({"stage": stage_name, "count": count, "conversion_rate": pct})
+
+        assessments = db.execute(
+            f"""SELECT x.id, x.job_id, x.status, x.result, x.score_percentage
+            FROM assessments x WHERE x.job_id IN ({placeholders})""",
+            tuple(job_ids),
+        ).fetchall()
+
+        interviews_count = db.execute(
+            f"""SELECT COUNT(*) FROM interviews i
+            JOIN applications a ON a.id = i.application_id
+            WHERE a.job_id IN ({placeholders})""",
+            tuple(job_ids),
+        ).fetchone()[0]
+
+        ready_count = 0
+        incomplete_count = 0
+        jobs_breakdown = []
+        for j in jobs:
+            s = job_question_summary(db, j["id"])
+            if s["ready"]:
+                ready_count += 1
+            else:
+                incomplete_count += 1
+            job_apps = [a for a in all_apps if a["job_id"] == j["id"]]
+            job_ass = [x for x in assessments if x["job_id"] == j["id"] and x["status"] == "Completed"]
+            job_passed = sum(1 for x in job_ass if x["result"] == "Passed")
+            avg_s = round(sum(x["score_percentage"] or 0.0 for x in job_ass) / len(job_ass), 1) if job_ass else None
+            jobs_breakdown.append({
+                "job_id": j["id"],
+                "title": j["title"],
+                "company": j["company"],
+                "status": j["status"],
+                "assessment_question_count": j["assessment_question_count"],
+                "allow_detailed_results": bool(j["allow_detailed_results"]),
+                "applicant_count": len(job_apps),
+                "assessment_completed_count": len(job_ass),
+                "assessment_pass_rate": round(job_passed / len(job_ass) * 100, 1) if job_ass else None,
+                "average_score": avg_s,
+                "question_bank_ready": s["ready"],
+                "additional_questions_needed": s["additional_needed"],
+            })
+
+        all_skills: dict[str, int] = {}
+        for j in jobs:
+            try:
+                for sk in json.loads(j["skills_json"] or "[]"):
+                    all_skills[sk] = all_skills.get(sk, 0) + 1
+            except Exception:
+                pass
+        top_skills = [{"skill": k, "count": v} for k, v in sorted(all_skills.items(), key=lambda x: x[1], reverse=True)[:8]]
+
+        return {
+            "range": report_range,
+            "start_date": start.isoformat(),
+            "end_date": (end - timedelta(days=1)).isoformat(),
+            "summary": {
+                "total_jobs": len(jobs),
+                "total_applications": len(all_apps),
+                "applications_in_period": len(apps),
+                "assessments_completed": sum(1 for x in assessments if x["status"] == "Completed"),
+                "interviews_scheduled": interviews_count,
+                "accepted": sum(1 for a in all_apps if a["status"] in ("Accepted", "Selected")),
+            },
+            "conversion_funnel": funnel,
+            "jobs_breakdown": jobs_breakdown,
+            "top_skills": top_skills,
+            "question_bank_readiness": {
+                "ready_jobs": ready_count,
+                "incomplete_jobs": incomplete_count,
+            },
+        }
+
+
+@app.get("/api/assessment-reviews/{assessment_id}/proctoring")
+def assessment_proctoring_review(
+    assessment_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute(
+            """SELECT x.id, x.proctoring_required, x.proctoring_consent_at,
+            x.camera_permission_granted_at, x.proctoring_started_at,
+            x.proctoring_warning_count, x.proctoring_flagged_at,
+            x.starts_at, x.status, j.title, j.company,
+            u.name AS candidate_name, u.email AS candidate_email
+            FROM assessments x JOIN jobs j ON j.id = x.job_id
+            JOIN users u ON u.id = x.candidate_id
+            WHERE x.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+            (assessment_id, user["role"], user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Assessment not found for your job listings")
+        events = db.execute(
+            """SELECT event_type, severity, duration_seconds, created_at
+            FROM assessment_proctoring_events WHERE assessment_id = ?
+            ORDER BY created_at, id""",
+            (assessment_id,),
+        ).fetchall()
+    return {
+        **dict(row),
+        "flagged": row["proctoring_flagged_at"] is not None,
+        "events": [dict(event) for event in events],
+    }
+
+
+@app.get("/api/admin/proctoring")
+def admin_proctoring(
+    candidate: str | None = None,
+    job_id: int | None = None,
+    recruiter_id: int | None = None,
+    start_date: date | None = None,
+    end_date: date | None = None,
+    flagged_only: bool | None = None,
+    limit: int = 100,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    del user
+    if not 1 <= limit <= 200:
+        raise HTTPException(status_code=422, detail="Limit must be between 1 and 200")
+    if start_date and end_date and end_date < start_date:
+        raise HTTPException(status_code=422, detail="end_date must be on or after start_date")
+    conditions = ["(x.proctoring_required = 1 OR EXISTS (SELECT 1 FROM assessment_proctoring_events e WHERE e.assessment_id = x.id))"]
+    params: list[Any] = []
+    if candidate:
+        conditions.append("(candidate.name LIKE ? OR candidate.email LIKE ?)")
+        params.extend([f"%{candidate}%", f"%{candidate}%"])
+    if job_id is not None:
+        conditions.append("x.job_id = ?")
+        params.append(job_id)
+    if recruiter_id is not None:
+        conditions.append("j.recruiter_id = ?")
+        params.append(recruiter_id)
+    if start_date:
+        conditions.append("COALESCE(x.proctoring_started_at, x.created_at) >= ?")
+        params.append(datetime.combine(start_date, datetime.min.time(), timezone.utc).isoformat())
+    if end_date:
+        conditions.append("COALESCE(x.proctoring_started_at, x.created_at) < ?")
+        params.append(datetime.combine(end_date + timedelta(days=1), datetime.min.time(), timezone.utc).isoformat())
+    if flagged_only:
+        conditions.append("x.proctoring_flagged_at IS NOT NULL")
+    elif flagged_only is False:
+        conditions.append("x.proctoring_flagged_at IS NULL")
+    with connect() as db:
+        rows = db.execute(
+            f"""SELECT x.id, x.application_id, x.status, x.proctoring_required,
+            x.proctoring_started_at, x.proctoring_warning_count, x.proctoring_flagged_at,
+            j.id AS job_id, j.title, j.company, j.recruiter_id,
+            recruiter.name AS recruiter_name, candidate.id AS candidate_id,
+            candidate.name AS candidate_name, candidate.email AS candidate_email,
+            r.id AS recording_id, COALESCE(r.recording_status, x.recording_status) AS recording_status,
+            r.duration_seconds AS recording_duration, r.upload_error AS recording_error
+            FROM assessments x JOIN jobs j ON j.id = x.job_id
+            JOIN users candidate ON candidate.id = x.candidate_id
+            JOIN users recruiter ON recruiter.id = j.recruiter_id
+            LEFT JOIN assessment_recordings r ON r.assessment_id = x.id
+            WHERE {' AND '.join(conditions)}
+            ORDER BY COALESCE(x.proctoring_flagged_at, x.proctoring_started_at, x.created_at) DESC,
+            x.id DESC LIMIT ?""",
+            (*params, limit),
+        ).fetchall()
+        assessment_ids = [row["id"] for row in rows]
+        events_by_assessment: dict[int, list[dict[str, Any]]] = {assessment_id: [] for assessment_id in assessment_ids}
+        if assessment_ids:
+            placeholders = ",".join("?" for _ in assessment_ids)
+            events = db.execute(
+                f"""SELECT assessment_id, event_type, severity, duration_seconds, created_at
+                FROM assessment_proctoring_events
+                WHERE assessment_id IN ({placeholders}) ORDER BY created_at, id""",
+                assessment_ids,
+            ).fetchall()
+            for event in events:
+                events_by_assessment[event["assessment_id"]].append({
+                    "event_type": event["event_type"],
+                    "severity": event["severity"],
+                    "duration_seconds": event["duration_seconds"],
+                    "created_at": event["created_at"],
+                })
+    return {
+        "items": [
+            {
+                **dict(row),
+                "flagged": row["proctoring_flagged_at"] is not None,
+                "events": events_by_assessment[row["id"]],
+            }
+            for row in rows
+        ]
+    }
+
+
+@app.patch("/api/applications/{application_id}/assessment/topic")
+def select_assessment_topic(
+    application_id: int,
+    body: AssessmentTopicBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        managed = managed_assessment(db, application_id, user)
+        if managed["match_percentage"] is None or managed["match_percentage"] < 70:
+            raise HTTPException(status_code=409, detail="Only candidates with a match of 70% or higher are eligible")
+        if managed["application_status"] in {"Withdrawn", "Rejected", "Accepted", "Selected"}:
+            raise HTTPException(status_code=409, detail="This application is no longer eligible for an assessment")
+        if managed["assessment_status"] != "Manual Topic Required":
+            raise HTTPException(status_code=409, detail="A manual topic can only be set when automatic selection is unavailable")
+            # Manual selections must still have a complete, relevant job-specific bank.
+        bank_count = db.execute(
+            """SELECT COUNT(*) FROM job_questions
+            WHERE job_id = ? AND lower(technology) = lower(?) AND active = 1""",
+            (managed["job_id"], body.technology),
+        ).fetchone()[0]
+        if bank_count < 20:
+            raise HTTPException(
+                status_code=409,
+                detail=f"Add {20 - bank_count} more active {body.technology} questions before selecting this topic",
+            )
+        db.execute(
+            """UPDATE assessments SET technology = ?, status = 'Not Sent',
+            question_topics_json = ?, question_topic_weights_json = ?, selection_reasoning = ?
+            WHERE id = ?""",
+            (
+                body.technology, json.dumps([body.technology]),
+                json.dumps({body.technology: 1}),
+                "The recruiter selected this topic because no relevant topic could be inferred automatically.",
+                managed["assessment_id"],
+            ),
+        )
+    return {"technology": body.technology, "status": "Not Sent"}
+
+
+def public_assessment_for_token(
+    db: sqlite3.Connection,
+    token: str,
+    *,
+    check_deadline: bool = True,
+    allow_submitted: bool = False,
+) -> tuple[sqlite3.Row | None, str | None]:
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    where = "WHERE (x.token_hash = ?" + (" OR x.submitted_token_hash = ?" if allow_submitted else "") + ")"
+    params: tuple[Any, ...] = (token_hash, token_hash) if allow_submitted else (token_hash,)
+    row = db.execute(
+        f"""SELECT x.*, j.title, j.company, a.status AS application_status
+        FROM assessments x JOIN jobs j ON j.id = x.job_id
+        JOIN applications a ON a.id = x.application_id
+        {where}""",
+        params,
+    ).fetchone()
+    if not row:
+        return None, "This assessment link is invalid or has already been used"
+    if row["application_status"] in {"Withdrawn", "Rejected", "Accepted", "Selected"}:
+        db.execute(
+            "UPDATE assessments SET token_hash = NULL, status = 'Expired' WHERE id = ? AND status NOT IN ('Completed', 'Pending Recruiter Decision')",
+            (row["id"],),
+        )
+        return row, "This assessment is no longer available"
+    valid_statuses = {"Sent", "Started", "Completed", "Pending Recruiter Decision"} if allow_submitted else {"Sent", "Started"}
+    if row["status"] not in valid_statuses:
+        return row, "This assessment link is invalid or has already been used"
+    if check_deadline and row["expires_at"]:
+        if row["status"] not in {"Completed", "Pending Recruiter Decision"} and datetime.fromisoformat(row["expires_at"]) <= datetime.now(timezone.utc):
+            changed = db.execute(
+                "UPDATE assessments SET token_hash = NULL, status = 'Expired' WHERE id = ?",
+                (row["id"],),
+            ).rowcount
+            if changed:
+                application = db.execute(
+                    "SELECT status FROM applications WHERE id = ?", (row["application_id"],)
+                ).fetchone()
+                if application and application["status"] in {"Assessment Sent", "Assessment Started"}:
+                    db.execute(
+                        "UPDATE applications SET status = 'Assessment Expired' WHERE id = ?",
+                        (row["application_id"],),
+                    )
+                    record_application_status(
+                        db, row["application_id"], "Assessment Expired",
+                        {"id": None, "role": "system"},
+                    )
+                notify_assessment_expired(db, row)
+            return row, "This assessment has expired"
+    return row, None
+
+
+def assessment_payload(db: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    questions = []
+    if row["status"] == "Started":
+        questions = db.execute(
+            """SELECT id, question_order, question_snapshot, options_snapshot
+            FROM assessment_questions WHERE assessment_id = ? ORDER BY question_order""",
+            (row["id"],),
+        ).fetchall()
+    return {
+        "title": row["assessment_name"],
+        "assessment_name": row["assessment_name"],
+        "assessment_round": row["assessment_round"],
+        "job_title": row["title"],
+        "company": row["company"],
+        "technology": row["technology"],
+        "status": row["status"],
+        "total_questions": row["total_questions"],
+        "duration_minutes": row["duration_minutes"],
+        "pass_percentage": row["pass_percentage"],
+        "starts_at": row["starts_at"],
+        "expires_at": row["expires_at"],
+        "proctoring": {
+            "required": bool(row["proctoring_required"]),
+            "consent_given": row["proctoring_consent_at"] is not None,
+            "camera_permission_granted": row["camera_permission_granted_at"] is not None,
+            "warning_count": row["proctoring_warning_count"],
+            "max_warnings": PROCTORING_MAX_WARNINGS,
+            "face_missing_warning_seconds": PROCTORING_FACE_MISSING_SECONDS,
+            "flagged": row["proctoring_flagged_at"] is not None,
+            "auto_submit": PROCTORING_AUTO_SUBMIT,
+            "recording_required": bool(row["recording_required"] if "recording_required" in row.keys() else 1),
+            "recording_consent_given": (row["recording_consent_given_at"] is not None) if "recording_consent_given_at" in row.keys() else False,
+            "recording_consent_version": row["recording_consent_version"] if "recording_consent_version" in row.keys() else "1.0",
+            "recording_status": row["recording_status"] if "recording_status" in row.keys() else "Pending",
+        },
+        "questions": [
+            {
+                "id": question["id"],
+                "order": question["question_order"],
+                "question": question["question_snapshot"],
+                "options": json.loads(question["options_snapshot"]),
+            }
+            for question in questions
+        ],
+    }
+
+
+def insert_proctoring_event(
+    db: sqlite3.Connection,
+    assessment_id: int,
+    event_type: str,
+    severity: str,
+    duration_seconds: int | None = None,
+) -> None:
+    db.execute(
+        """INSERT INTO assessment_proctoring_events
+        (assessment_id, event_type, severity, duration_seconds, created_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (assessment_id, event_type, severity, duration_seconds, now()),
+    )
+
+
+@app.get("/api/assessments/{token}")
+def get_public_assessment(token: str) -> dict[str, Any]:
+    with connect() as db:
+        row, error = public_assessment_for_token(db, token)
+        payload = assessment_payload(db, row) if row and not error else None
+    if error:
+        raise HTTPException(status_code=410 if row else 404, detail=error)
+    return payload
+
+
+@app.post("/api/assessments/{token}/proctoring/start")
+def start_assessment_proctoring(
+    token: str,
+    body: AssessmentProctoringStartBody,
+) -> dict[str, Any]:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row, error = public_assessment_for_token(db, token)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+        if row["status"] not in {"Sent", "Started"}:
+            raise HTTPException(status_code=409, detail="This assessment is not available to start")
+        if not body.consent_given or not body.camera_permission_granted or not getattr(body, "recording_consent_given", True):
+            insert_proctoring_event(db, row["id"], "camera_denied", "info")
+            return {"started": False, "required": bool(row["proctoring_required"])}
+        consented_at = now()
+        rec_version = getattr(body, "recording_consent_version", "1.0") or "1.0"
+        db.execute(
+            """UPDATE assessments SET proctoring_consent_at = COALESCE(proctoring_consent_at, ?),
+            camera_permission_granted_at = COALESCE(camera_permission_granted_at, ?),
+            recording_consent_given_at = COALESCE(recording_consent_given_at, ?),
+            recording_consent_version = COALESCE(recording_consent_version, ?)
+            WHERE id = ?""",
+            (consented_at, consented_at, consented_at, rec_version, row["id"]),
+        )
+        insert_proctoring_event(db, row["id"], "camera_granted", "info")
+    return {"started": True, "required": bool(row["proctoring_required"])}
+
+
+@app.post("/api/assessments/{token}/proctoring/events")
+def record_assessment_proctoring_event(
+    token: str,
+    body: AssessmentProctoringEventBody,
+) -> dict[str, Any]:
+    warning_events = {
+        "camera_denied", "face_missing", "multiple_faces", "tab_hidden",
+        "window_blur", "camera_stopped",
+    }
+    if body.event_type == "face_missing" and (
+        body.duration_seconds is None
+        or body.duration_seconds < PROCTORING_FACE_MISSING_SECONDS
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail=f"A face-missing warning requires at least {PROCTORING_FACE_MISSING_SECONDS} seconds.",
+        )
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row, error = public_assessment_for_token(db, token)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+        if body.event_type == "camera_denied" and row["status"] == "Sent":
+            severity = "info"
+        elif row["status"] == "Started":
+            severity = "warning" if body.event_type in warning_events else "info"
+        else:
+            raise HTTPException(status_code=409, detail="Proctoring events require an active assessment")
+        recent_events = db.execute(
+            """SELECT COUNT(*) FROM assessment_proctoring_events
+            WHERE assessment_id = ? AND created_at >= ?""",
+            (row["id"], (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()),
+        ).fetchone()[0]
+        if recent_events >= 60:
+            raise HTTPException(status_code=429, detail="Too many proctoring events; try again shortly")
+        insert_proctoring_event(db, row["id"], body.event_type, severity, body.duration_seconds)
+        if severity == "warning":
+            db.execute(
+                """UPDATE assessments SET proctoring_warning_count = proctoring_warning_count + 1,
+                proctoring_flagged_at = CASE
+                    WHEN proctoring_warning_count + 1 >= ? THEN COALESCE(proctoring_flagged_at, ?)
+                    ELSE proctoring_flagged_at END
+                WHERE id = ?""",
+                (PROCTORING_MAX_WARNINGS, now(), row["id"]),
+            )
+            updated = db.execute(
+                """SELECT proctoring_warning_count, proctoring_flagged_at
+                FROM assessments WHERE id = ?""",
+                (row["id"],),
+            ).fetchone()
+            if updated["proctoring_flagged_at"] and not row["proctoring_flagged_at"]:
+                admins = db.execute(
+                    "SELECT id FROM users WHERE role = 'admin' AND active = 1"
+                ).fetchall()
+                for admin in admins:
+                    add_notification(
+                        db, admin["id"], "assessment_proctoring_flagged",
+                        "Assessment flagged for integrity review",
+                        f"An assessment for {row['title']} reached the proctoring warning threshold.",
+                        application_id=row["application_id"], assessment_id=row["id"],
+                    )
+        else:
+            updated = db.execute(
+                """SELECT proctoring_warning_count, proctoring_flagged_at
+                FROM assessments WHERE id = ?""",
+                (row["id"],),
+            ).fetchone()
+    return {
+        "warning_count": updated["proctoring_warning_count"],
+        "max_warnings": PROCTORING_MAX_WARNINGS,
+        "flagged": updated["proctoring_flagged_at"] is not None,
+        "auto_submit": PROCTORING_AUTO_SUBMIT,
+        "should_auto_submit": PROCTORING_AUTO_SUBMIT
+        and updated["proctoring_flagged_at"] is not None
+        and row["proctoring_flagged_at"] is None,
+    }
+
+
+@app.get("/api/assessments/{token}/proctoring/status")
+def get_assessment_proctoring_status(token: str) -> dict[str, Any]:
+    with connect() as db:
+        row, error = public_assessment_for_token(db, token)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+    return {
+        "required": bool(row["proctoring_required"]),
+        "warning_count": row["proctoring_warning_count"],
+        "max_warnings": PROCTORING_MAX_WARNINGS,
+        "face_missing_warning_seconds": PROCTORING_FACE_MISSING_SECONDS,
+        "flagged": row["proctoring_flagged_at"] is not None,
+        "auto_submit": PROCTORING_AUTO_SUBMIT,
+    }
+
+
+@app.post("/api/assessments/{token}/start")
+def start_public_assessment(token: str) -> dict[str, Any]:
+    error = None
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row, error = public_assessment_for_token(db, token)
+        rec_req = bool(row["recording_required"]) if "recording_required" in row.keys() else False
+        rec_consented = (row["recording_consent_given_at"] is not None) if "recording_consent_given_at" in row.keys() else False
+        if row and not error and row["proctoring_required"] and (
+            row["proctoring_consent_at"] is None
+            or row["camera_permission_granted_at"] is None
+            or (rec_req and not rec_consented)
+        ):
+            error = "Provide consent and enable camera access before starting this assessment"
+        if row and not error and row["status"] == "Sent":
+            started_at = datetime.now(timezone.utc)
+            deadline = started_at.timestamp() + row["duration_minutes"] * 60
+            db.execute(
+                """UPDATE assessments SET status = 'Started', starts_at = ?, expires_at = ?
+                , proctoring_started_at = ?
+                WHERE id = ? AND status = 'Sent'""",
+                (
+                    started_at.isoformat(),
+                    datetime.fromtimestamp(deadline, timezone.utc).isoformat(),
+                    started_at.isoformat(),
+                    row["id"],
+                ),
+            )
+            insert_proctoring_event(db, row["id"], "assessment_started", "info")
+            row = db.execute(
+                """SELECT x.*, j.title, j.company, a.status AS application_status
+                FROM assessments x JOIN jobs j ON j.id = x.job_id
+                JOIN applications a ON a.id = x.application_id WHERE x.id = ?""",
+                (row["id"],),
+            ).fetchone()
+            application = db.execute(
+                """SELECT a.id, a.candidate_id, a.status, j.recruiter_id, j.title
+                FROM applications a JOIN jobs j ON j.id = a.job_id WHERE a.id = ?""",
+                (row["application_id"],),
+            ).fetchone()
+            if application and application["status"] == "Assessment Sent":
+                db.execute(
+                    "UPDATE applications SET status = 'Assessment Started' WHERE id = ?",
+                    (application["id"],),
+                )
+                record_application_status(
+                    db, application["id"], "Assessment Started", {"id": None, "role": "candidate"}
+                )
+                notify_user(
+                    db, application["recruiter_id"], "assessment_started", "Candidate started an assessment",
+                    f"A candidate started the assessment for {application['title']}.",
+                    application_id=application["id"], assessment_id=row["id"],
+                )
+                notify_user(
+                    db, application["candidate_id"], "assessment_started",
+                    "Assessment started", f"You started the assessment for {application['title']}.",
+                    application_id=application["id"], assessment_id=row["id"],
+                )
+        payload = assessment_payload(db, row) if row and not error else None
+    if error:
+        status_code = 409 if "consent" in error.lower() or "camera" in error.lower() else 410 if row else 404
+        raise HTTPException(status_code=status_code, detail=error)
+    return payload
+
+
+@app.post("/api/assessments/{token}/submit")
+def submit_public_assessment(token: str, body: AssessmentSubmitBody) -> dict[str, Any]:
+    error = None
+    response = None
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row, error = public_assessment_for_token(db, token, check_deadline=False)
+        if row and not error and row["expires_at"] and datetime.fromisoformat(row["expires_at"]) <= datetime.now(timezone.utc):
+            if row["status"] == "Sent":
+                db.execute(
+                    "UPDATE assessments SET status = 'Expired', token_hash = NULL WHERE id = ?",
+                    (row["id"],),
+                )
+                error = "This assessment has expired"
+        if row and not error and row["status"] == "Sent":
+            error = "Start the assessment before submitting answers"
+        if row and not error:
+            if row["starts_at"] is None:
+                error = "Start the assessment before submitting answers"
+            else:
+                questions = db.execute(
+                    "SELECT id, correct_index FROM assessment_questions WHERE assessment_id = ?",
+                    (row["id"],),
+                ).fetchall()
+                known_ids = {question["id"] for question in questions}
+                if any(question_id not in known_ids or answer not in range(4) for question_id, answer in body.answers.items()):
+                    error = "Answers contain an invalid question or option"
+                else:
+                    score = 0
+                    submitted_at = now()
+                    for question in questions:
+                        selected = body.answers.get(question["id"])
+                        correct = selected == question["correct_index"]
+                        score += int(correct)
+                        db.execute(
+                            """UPDATE assessment_questions SET selected_answer = ?, is_correct = ?,
+                            answered_at = ? WHERE id = ?""",
+                            (selected, int(correct), submitted_at if selected is not None else None, question["id"]),
+                        )
+                    score_percentage = score * 100.0 / len(questions) if questions else 0.0
+                    result = "Passed" if score_percentage >= row["pass_percentage"] else "Failed"
+                    score_percentage = round(score_percentage, 2)
+                    starts_at = datetime.fromisoformat(row["starts_at"])
+                    submitted_datetime = datetime.fromisoformat(submitted_at)
+                    time_taken_seconds = max(0, int((submitted_datetime - starts_at).total_seconds()))
+                    status = "Pending Recruiter Decision"
+                    changed = db.execute(
+                        """UPDATE assessments SET status = ?, submitted_at = ?, score = ?,
+                        score_percentage = ?, correct_answer_count = ?, incorrect_answer_count = ?,
+                        result = ?, result_processed_at = ?, time_taken_seconds = ?,
+                        submitted_token_hash = token_hash, token_hash = NULL
+                        WHERE id = ? AND status = 'Started' AND result_processed_at IS NULL""",
+                        (
+                            status, submitted_at, score, score_percentage, score,
+                            len(questions) - score, result, submitted_at, time_taken_seconds, row["id"],
+                        ),
+                    ).rowcount
+                    if changed != 1:
+                        error = "This assessment has already been submitted"
+                    else:
+                        application = db.execute(
+                            """SELECT a.id, a.candidate_id, a.status, j.recruiter_id, j.title,
+                            u.name AS candidate_name
+                            FROM applications a JOIN jobs j ON j.id = a.job_id
+                            JOIN users u ON u.id = a.candidate_id
+                            WHERE a.id = ?""",
+                            (row["application_id"],),
+                        ).fetchone()
+                        if application:
+                            if application["status"] in {
+                                "Assessment Sent", "Assessment Started", "Assessment Completed",
+                            }:
+                                if application["status"] != "Assessment Completed":
+                                    db.execute(
+                                        "UPDATE applications SET status = 'Assessment Completed' WHERE id = ?",
+                                        (application["id"],),
+                                    )
+                                    record_application_status(
+                                        db, application["id"], "Assessment Completed",
+                                        {"id": None, "role": "candidate"},
+                                    )
+                            candidate_title = "Assessment submitted"
+                            candidate_message = (
+                                f"Your assessment for {row['title']} has been submitted successfully. "
+                                f"The recruiter will review your results and update your application status."
+                            )
+                            notify_user(
+                                db, application["candidate_id"], "assessment_submitted",
+                                candidate_title, candidate_message,
+                                application_id=application["id"], assessment_id=row["id"], email=True,
+                            )
+                            notify_user(
+                                db, application["recruiter_id"], "round1_assessment_completed",
+                                "Round 1 assessment completed",
+                                f"{application['candidate_name']} completed the assessment for "
+                                f"{row['title']}. Review results to make a pass/fail decision.",
+                                application_id=application["id"], assessment_id=row["id"], email=True,
+                            )
+                            admins = db.execute(
+                                "SELECT id FROM users WHERE role = 'admin' AND active = 1"
+                            ).fetchall()
+                            for admin in admins:
+                                add_notification(
+                                    db, admin["id"], "round1_assessment_completed",
+                                    "Round 1 assessment completed",
+                                    f"{application['candidate_name']} completed Round 1 for {row['title']}.",
+                                    application_id=application["id"], assessment_id=row["id"],
+                                )
+                        response = {
+                            "status": status,
+                            "assessment_name": row["assessment_name"],
+                            "assessment_round": row["assessment_round"],
+                            "job_title": row["title"],
+                            "submitted_at": submitted_at,
+                            "time_taken_seconds": time_taken_seconds,
+                            "message": "Your assessment has been submitted successfully. The recruiter will review your results and update your application status.",
+                        }
+    if error:
+        if "expired" in error.lower() or "available" in error.lower():
+            status_code = 410
+        elif "invalid question" in error.lower():
+            status_code = 422
+        else:
+            status_code = 409
+        raise HTTPException(status_code=status_code, detail=error)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Proctoring Webcam Video Recording & Cloudinary Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/assessments/{token}/recording/start")
+def start_assessment_recording(
+    token: str,
+    body: AssessmentRecordingStartBody,
+) -> dict[str, Any]:
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row, error = public_assessment_for_token(db, token, allow_submitted=False)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+        if row["status"] not in {"Sent", "Started"}:
+            raise HTTPException(status_code=409, detail="Assessment is not active")
+        if not body.consent:
+            raise HTTPException(status_code=400, detail="Webcam recording consent is required")
+
+        now_iso = now()
+        db.execute(
+            """UPDATE assessments SET recording_consent_given_at = ?,
+            recording_consent_version = ?, recording_status = 'Pending' WHERE id = ?""",
+            (now_iso, body.consent_version, row["id"]),
+        )
+        existing = db.execute(
+            "SELECT id FROM assessment_recordings WHERE assessment_id = ?",
+            (row["id"],),
+        ).fetchone()
+        if existing:
+            rec_id = existing["id"]
+            db.execute(
+                """UPDATE assessment_recordings SET recording_status = 'Pending',
+                started_at = ?, updated_at = ? WHERE id = ?""",
+                (now_iso, now_iso, rec_id),
+            )
+        else:
+            cur = db.execute(
+                """INSERT INTO assessment_recordings
+                (assessment_id, application_id, candidate_id, recording_status, started_at, created_at, updated_at)
+                VALUES (?, ?, ?, 'Pending', ?, ?, ?)""",
+                (row["id"], row["application_id"], row["candidate_id"], now_iso, now_iso, now_iso),
+            )
+            rec_id = cur.lastrowid
+
+    return {"recording_id": rec_id, "status": "Pending", "started_at": now_iso}
+
+
+@app.post("/api/assessments/{token}/recording/chunk")
+async def upload_assessment_recording_chunk(
+    token: str,
+    chunk_index: int = 0,
+    chunk: UploadFile = File(...),
+) -> dict[str, Any]:
+    with connect() as db:
+        row, error = public_assessment_for_token(db, token, allow_submitted=True)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+        if row["status"] not in {"Started", "Completed"}:
+            raise HTTPException(status_code=409, detail="Assessment is not in progress")
+
+    chunk_data = await chunk.read()
+    max_chunk_bytes = 15 * 1024 * 1024
+    if len(chunk_data) > max_chunk_bytes:
+        raise HTTPException(status_code=413, detail="Chunk exceeds maximum allowed size")
+
+    chunk_dir = RECORDINGS_STORAGE_DIR / f"temp_{row['id']}"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    chunk_file = chunk_dir / f"chunk_{chunk_index:05d}.part"
+    chunk_file.write_bytes(chunk_data)
+
+    with connect() as db:
+        db.execute("UPDATE assessments SET recording_status = 'Uploading' WHERE id = ?", (row["id"],))
+        db.execute(
+            """UPDATE assessment_recordings SET recording_status = 'Uploading', updated_at = ?
+            WHERE assessment_id = ?""",
+            (now(), row["id"]),
+        )
+
+    return {"chunk_index": chunk_index, "bytes_received": len(chunk_data), "status": "Uploading"}
+
+
+@app.post("/api/assessments/{token}/recording/complete")
+async def complete_assessment_recording(
+    token: str,
+    duration_seconds: int = 0,
+    video: UploadFile | None = File(default=None),
+) -> dict[str, Any]:
+    with connect() as db:
+        row, error = public_assessment_for_token(db, token, allow_submitted=True)
+        if error:
+            raise HTTPException(status_code=410 if row else 404, detail=error)
+
+    file_bytes: bytes = b""
+    if video is not None:
+        file_bytes = await video.read()
+    else:
+        chunk_dir = RECORDINGS_STORAGE_DIR / f"temp_{row['id']}"
+        if chunk_dir.exists():
+            chunks = sorted(chunk_dir.glob("chunk_*.part"))
+            if chunks:
+                assembled_parts = [ch.read_bytes() for ch in chunks]
+                file_bytes = b"".join(assembled_parts)
+                for ch in chunks:
+                    try:
+                        ch.unlink()
+                    except Exception:
+                        pass
+                try:
+                    chunk_dir.rmdir()
+                except Exception:
+                    pass
+
+    max_bytes = SKILLSPHERE_RECORDING_MAX_UPLOAD_MB * 1024 * 1024
+    if len(file_bytes) > max_bytes:
+        with connect() as db:
+            db.execute(
+                """UPDATE assessment_recordings SET recording_status = 'Failed',
+                upload_error = 'Video file exceeded size limit', updated_at = ? WHERE assessment_id = ?""",
+                (now(), row["id"]),
+            )
+            db.execute("UPDATE assessments SET recording_status = 'Failed' WHERE id = ?", (row["id"],))
+        raise HTTPException(status_code=413, detail="Recording exceeded maximum allowed file size")
+
+    if not file_bytes:
+        with connect() as db:
+            db.execute(
+                """UPDATE assessment_recordings SET recording_status = 'Partial',
+                upload_error = 'No video data was recorded or received', updated_at = ? WHERE assessment_id = ?""",
+                (now(), row["id"]),
+            )
+            db.execute("UPDATE assessments SET recording_status = 'Partial' WHERE id = ?", (row["id"],))
+        return {"recording_status": "Partial", "message": "No video data received"}
+
+    now_iso = now()
+    ended_at = now_iso
+    timestamp_tag = int(time.time())
+    public_id = f"recording_{row['id']}_{row['candidate_id']}_{timestamp_tag}"
+
+    with connect() as db:
+        rec_row = db.execute("SELECT id FROM assessment_recordings WHERE assessment_id = ?", (row["id"],)).fetchone()
+        if not rec_row:
+            db.execute(
+                """INSERT INTO assessment_recordings
+                (assessment_id, application_id, candidate_id, recording_status, started_at, created_at, updated_at)
+                VALUES (?, ?, ?, 'Uploading', ?, ?, ?)""",
+                (row["id"], row["application_id"], row["candidate_id"], now_iso, now_iso, now_iso),
+            )
+
+    cloudinary_ready = init_cloudinary()
+    if cloudinary_ready:
+        try:
+            upload_result = cloudinary.uploader.upload(
+                file_bytes,
+                resource_type="video",
+                folder=CLOUDINARY_UPLOAD_FOLDER,
+                public_id=public_id,
+                tags=[
+                    f"assessment_{row['id']}",
+                    f"application_{row['application_id']}",
+                    f"candidate_{row['candidate_id']}",
+                    f"job_{row['job_id']}",
+                    "proctoring",
+                ],
+                context={
+                    "assessment_id": str(row["id"]),
+                    "candidate_id": str(row["candidate_id"]),
+                    "application_id": str(row["application_id"]),
+                    "type": "proctoring_recording",
+                },
+            )
+            c_public_id = upload_result.get("public_id", public_id)
+            c_asset_id = upload_result.get("asset_id", "")
+            c_secure_url = upload_result.get("secure_url", "")
+            c_duration = int(upload_result.get("duration") or duration_seconds)
+            c_bytes = int(upload_result.get("bytes") or len(file_bytes))
+            c_format = upload_result.get("format", "webm")
+
+            with connect() as db:
+                db.execute(
+                    """UPDATE assessment_recordings SET
+                    cloudinary_public_id = ?,
+                    cloudinary_asset_id = ?,
+                    cloudinary_resource_type = 'video',
+                    secure_url = ?,
+                    duration_seconds = ?,
+                    file_size_bytes = ?,
+                    format = ?,
+                    recording_status = 'Uploaded',
+                    upload_error = NULL,
+                    ended_at = ?,
+                    uploaded_at = ?,
+                    updated_at = ?
+                    WHERE assessment_id = ?""",
+                    (
+                        c_public_id, c_asset_id, c_secure_url, c_duration,
+                        c_bytes, c_format, ended_at, now_iso, now_iso, row["id"],
+                    ),
+                )
+                db.execute(
+                    """UPDATE assessments SET recording_status = 'Uploaded',
+                    recording_available_at = ? WHERE id = ?""",
+                    (now_iso, row["id"]),
+                )
+            return {
+                "recording_status": "Uploaded",
+                "duration_seconds": c_duration,
+                "file_size_bytes": c_bytes,
+                "format": c_format,
+            }
+        except Exception as exc:
+            logger.error("Cloudinary video upload failed: %s", exc)
+            sanitized_err = "Cloudinary upload service failed"
+            with connect() as db:
+                db.execute(
+                    """UPDATE assessment_recordings SET
+                    recording_status = 'Failed',
+                    upload_error = ?,
+                    ended_at = ?,
+                    updated_at = ?
+                    WHERE assessment_id = ?""",
+                    (sanitized_err, ended_at, now_iso, row["id"]),
+                )
+                db.execute(
+                    """UPDATE assessments SET recording_status = 'Failed',
+                    recording_failure_reason = ? WHERE id = ?""",
+                    (sanitized_err, row["id"]),
+                )
+                admins = db.execute("SELECT id FROM users WHERE role = 'admin' AND active = 1").fetchall()
+                for adm in admins:
+                    add_notification(
+                        db, adm["id"], "recording_failed",
+                        "Assessment recording upload failed",
+                        f"Video recording for assessment #{row['id']} failed to upload to Cloudinary.",
+                        assessment_id=row["id"],
+                    )
+            return {"recording_status": "Failed", "error": sanitized_err}
+    else:
+        # Development / Local fallback mode
+        local_path = RECORDINGS_STORAGE_DIR / f"{public_id}.webm"
+        local_path.write_bytes(file_bytes)
+        file_size = len(file_bytes)
+        local_ref = f"/api/admin/recordings/{row['id']}/stream"
+
+        with connect() as db:
+            db.execute(
+                """UPDATE assessment_recordings SET
+                cloudinary_public_id = ?,
+                cloudinary_asset_id = ?,
+                cloudinary_resource_type = 'video',
+                secure_url = ?,
+                duration_seconds = ?,
+                file_size_bytes = ?,
+                format = 'webm',
+                recording_status = 'Uploaded',
+                upload_error = NULL,
+                ended_at = ?,
+                uploaded_at = ?,
+                updated_at = ?
+                WHERE assessment_id = ?""",
+                (
+                    public_id, "local_asset", local_ref, duration_seconds,
+                    file_size, ended_at, now_iso, now_iso, row["id"],
+                ),
+            )
+            db.execute(
+                """UPDATE assessments SET recording_status = 'Uploaded',
+                recording_available_at = ? WHERE id = ?""",
+                (now_iso, row["id"]),
+            )
+        return {
+            "recording_status": "Uploaded",
+            "duration_seconds": duration_seconds,
+            "file_size_bytes": file_size,
+            "format": "webm",
+        }
+
+
+@app.get("/api/admin/assessments/{assessment_id}/recordings")
+def get_assessment_recordings(
+    assessment_id: int,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT id, assessment_id, application_id, candidate_id,
+            cloudinary_public_id, cloudinary_resource_type, duration_seconds,
+            file_size_bytes, format, recording_status, upload_error, started_at,
+            ended_at, uploaded_at, created_at, updated_at
+            FROM assessment_recordings WHERE assessment_id = ?""",
+            (assessment_id,),
+        ).fetchall()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.get("/api/admin/recordings/{recording_id}/playback")
+def get_recording_playback(
+    recording_id: int,
+    request: Request,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        rec = db.execute(
+            """SELECT r.*, a.status AS assessment_status, u.name AS candidate_name
+            FROM assessment_recordings r
+            JOIN assessments a ON a.id = r.assessment_id
+            JOIN users u ON u.id = r.candidate_id
+            WHERE r.id = ?""",
+            (recording_id,),
+        ).fetchone()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+
+        if rec["recording_status"] != "Uploaded":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Recording is not ready for playback (status: {rec['recording_status']})",
+            )
+
+        ip_addr = request.client.host if request.client else "unknown"
+        ua = request.headers.get("user-agent", "")[:250]
+        db.execute(
+            """INSERT INTO recording_access_logs
+            (recording_id, admin_id, accessed_at, ip_address, user_agent)
+            VALUES (?, ?, ?, ?, ?)""",
+            (recording_id, user["id"], now(), ip_addr, ua),
+        )
+
+        cloudinary_ready = init_cloudinary()
+        expires_seconds = 3600
+        expires_at = int(time.time()) + expires_seconds
+
+        if cloudinary_ready and rec["cloudinary_asset_id"] != "local_asset" and rec["cloudinary_public_id"]:
+            playback_url = cloudinary.utils.cloudinary_url(
+                rec["cloudinary_public_id"],
+                resource_type="video",
+                sign_url=True,
+                secure=True,
+                expires_at=expires_at,
+            )[0]
+        else:
+            playback_url = f"/api/admin/recordings/{recording_id}/stream"
+
+        events = db.execute(
+            """SELECT event_type, severity, duration_seconds, created_at
+            FROM assessment_proctoring_events WHERE assessment_id = ? ORDER BY created_at ASC""",
+            (rec["assessment_id"],),
+        ).fetchall()
+
+    return {
+        "recording_id": rec["id"],
+        "assessment_id": rec["assessment_id"],
+        "candidate_name": rec["candidate_name"],
+        "playback_url": playback_url,
+        "expires_in_seconds": expires_seconds,
+        "duration_seconds": rec["duration_seconds"],
+        "format": rec["format"],
+        "recording_status": rec["recording_status"],
+        "events": [dict(e) for e in events],
+    }
+
+
+@app.get("/api/admin/recordings/{recording_id}/stream")
+def stream_recording_video(
+    recording_id: int,
+    request: Request,
+    token: str = "",
+    authorization: str | None = Header(default=None),
+) -> FileResponse:
+    auth_token = token or (authorization.replace("Bearer ", "") if authorization else "") or request.cookies.get(AUTH_COOKIE_NAME, "")
+    user = decode_token(auth_token)
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin authorization required")
+
+    with connect() as db:
+        rec = db.execute(
+            "SELECT cloudinary_public_id, assessment_id FROM assessment_recordings WHERE id = ?",
+            (recording_id,),
+        ).fetchone()
+        if not rec:
+            raise HTTPException(status_code=404, detail="Recording not found")
+
+    public_id = rec["cloudinary_public_id"]
+    candidates = list(RECORDINGS_STORAGE_DIR.glob(f"*{public_id}*.webm"))
+    if not candidates:
+        candidates = list(RECORDINGS_STORAGE_DIR.glob(f"*recording_{rec['assessment_id']}*.webm"))
+    if not candidates:
+        raise HTTPException(status_code=404, detail="Local video file not found")
+
+    return FileResponse(candidates[0], media_type="video/webm")
+
+
+@app.get("/api/admin/recordings")
+def list_admin_recordings(
+    candidate: str = "",
+    job_id: str = "",
+    recruiter_id: str = "",
+    start_date: str = "",
+    end_date: str = "",
+    status: str = "",
+    flagged_only: str = "",
+    page: int = 1,
+    page_size: int = 50,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        where_clauses = ["1=1"]
+        params: list[Any] = []
+        if candidate:
+            where_clauses.append("(u.name LIKE ? OR u.email LIKE ?)")
+            params.extend([f"%{candidate}%", f"%{candidate}%"])
+        if job_id:
+            where_clauses.append("j.id = ?")
+            params.append(job_id)
+        if recruiter_id:
+            where_clauses.append("j.recruiter_id = ?")
+            params.append(recruiter_id)
+        if start_date:
+            where_clauses.append("r.created_at >= ?")
+            params.append(start_date)
+        if end_date:
+            where_clauses.append("r.created_at <= ?")
+            params.append(end_date + "T23:59:59")
+        if status:
+            where_clauses.append("r.recording_status = ?")
+            params.append(status)
+        if flagged_only == "true":
+            where_clauses.append("a.proctoring_flagged_at IS NOT NULL")
+        elif flagged_only == "false":
+            where_clauses.append("a.proctoring_flagged_at IS NULL")
+
+        where_sql = " AND ".join(where_clauses)
+        rows = db.execute(
+            f"""SELECT r.id, r.assessment_id, r.application_id, r.candidate_id,
+            r.recording_status, r.duration_seconds, r.file_size_bytes, r.format,
+            r.upload_error, r.started_at, r.ended_at, r.uploaded_at, r.created_at,
+            u.name AS candidate_name, u.email AS candidate_email,
+            j.title AS job_title, j.company AS job_company,
+            rec.name AS recruiter_name,
+            a.assessment_round, a.assessment_name, a.status AS assessment_status,
+            a.proctoring_warning_count, a.proctoring_flagged_at,
+            (SELECT COUNT(*) FROM assessment_proctoring_events WHERE assessment_id = a.id AND event_type = 'tab_hidden') AS tab_switch_count,
+            (SELECT COUNT(*) FROM assessment_proctoring_events WHERE assessment_id = a.id AND event_type = 'face_missing') AS face_missing_count
+            FROM assessment_recordings r
+            JOIN assessments a ON a.id = r.assessment_id
+            JOIN users u ON u.id = r.candidate_id
+            JOIN jobs j ON j.id = a.job_id
+            JOIN users rec ON rec.id = j.recruiter_id
+            WHERE {where_sql}
+            ORDER BY r.created_at DESC LIMIT ? OFFSET ?""",
+            (*params, page_size, (page - 1) * page_size),
+        ).fetchall()
+
+        total_recordings = db.execute("SELECT COUNT(*) FROM assessment_recordings").fetchone()[0]
+        uploads_pending = db.execute("SELECT COUNT(*) FROM assessment_recordings WHERE recording_status IN ('Pending', 'Uploading')").fetchone()[0]
+        uploads_failed = db.execute("SELECT COUNT(*) FROM assessment_recordings WHERE recording_status = 'Failed'").fetchone()[0]
+        flagged_with_rec = db.execute(
+            """SELECT COUNT(DISTINCT r.id) FROM assessment_recordings r
+            JOIN assessments a ON a.id = r.assessment_id
+            WHERE a.proctoring_flagged_at IS NOT NULL""",
+        ).fetchone()[0]
+        total_proctored = db.execute("SELECT COUNT(*) FROM assessments WHERE proctoring_required = 1").fetchone()[0]
+
+    return {
+        "items": [dict(r) for r in rows],
+        "metrics": {
+            "total_recordings": total_recordings,
+            "uploads_pending": uploads_pending,
+            "uploads_failed": uploads_failed,
+            "flagged_with_recordings": flagged_with_rec,
+            "total_proctored_assessments": total_proctored,
+            "recent_recordings": len(rows),
+        },
+    }
+
+
+@app.post("/api/admin/recordings/retention-cleanup")
+def cleanup_retention_recordings(
+    include_flagged: bool = False,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=SKILLSPHERE_RECORDING_RETENTION_DAYS)).isoformat()
+    with connect() as db:
+        flagged_clause = "" if include_flagged else " AND a.proctoring_flagged_at IS NULL"
+        expired_recs = db.execute(
+            f"""SELECT r.id, r.cloudinary_public_id FROM assessment_recordings r
+            JOIN assessments a ON a.id = r.assessment_id
+            WHERE r.created_at < ?{flagged_clause}""",
+            (cutoff_date,),
+        ).fetchall()
+
+        deleted_count = 0
+        cloudinary_ready = init_cloudinary()
+        for rec in expired_recs:
+            pub_id = rec["cloudinary_public_id"]
+            if pub_id:
+                if cloudinary_ready and not pub_id.startswith("local_"):
+                    try:
+                        cloudinary.uploader.destroy(pub_id, resource_type="video")
+                    except Exception as e:
+                        logger.warning("Failed to destroy Cloudinary video %s: %s", pub_id, e)
+                local_file = RECORDINGS_STORAGE_DIR / f"{pub_id}.webm"
+                if local_file.exists():
+                    try:
+                        local_file.unlink()
+                    except Exception:
+                        pass
+            db.execute("DELETE FROM assessment_recordings WHERE id = ?", (rec["id"],))
+            deleted_count += 1
+
+    return {
+        "deleted_count": deleted_count,
+        "cleaned_count": deleted_count,
+        "cutoff_date": cutoff_date,
+        "retention_days": SKILLSPHERE_RECORDING_RETENTION_DAYS,
+    }
+
+
+class LiveMonitoringManager:
+    def __init__(self) -> None:
+        self.candidate_sockets: dict[int, WebSocket] = {}
+        self.candidate_camera_active: dict[int, bool] = {}
+        self.recruiter_sockets: dict[int, set[WebSocket]] = {}
+        self.active_viewers: dict[int, set[str]] = {}
+
+    async def register_candidate(self, assessment_id: int, websocket: WebSocket) -> None:
+        await websocket.accept()
+        self.candidate_sockets[assessment_id] = websocket
+        self.candidate_camera_active[assessment_id] = True
+        await self.broadcast_to_recruiters(
+            assessment_id,
+            {"type": "candidate_status", "connected": True, "camera_connected": True, "status": "Assessment In Progress"},
+        )
+
+    async def unregister_candidate(self, assessment_id: int, websocket: WebSocket) -> None:
+        if self.candidate_sockets.get(assessment_id) == websocket:
+            del self.candidate_sockets[assessment_id]
+        self.candidate_camera_active[assessment_id] = False
+        await self.broadcast_to_recruiters(
+            assessment_id,
+            {"type": "candidate_status", "connected": False, "camera_connected": False, "status": "Camera Disconnected"},
+        )
+
+    def set_candidate_camera(self, assessment_id: int, active: bool) -> None:
+        self.candidate_camera_active[assessment_id] = active
+
+    async def register_recruiter(self, assessment_id: int, websocket: WebSocket, viewer_name: str) -> None:
+        await websocket.accept()
+        if assessment_id not in self.recruiter_sockets:
+            self.recruiter_sockets[assessment_id] = set()
+        self.recruiter_sockets[assessment_id].add(websocket)
+        if assessment_id not in self.active_viewers:
+            self.active_viewers[assessment_id] = set()
+        self.active_viewers[assessment_id].add(viewer_name)
+
+        has_cand = assessment_id in self.candidate_sockets
+        cam_active = bool(self.candidate_camera_active.get(assessment_id, False))
+
+        await websocket.send_json({
+            "type": "candidate_status",
+            "connected": has_cand,
+            "camera_connected": has_cand and cam_active,
+            "status": "Assessment In Progress" if has_cand else "Monitoring Unavailable",
+        })
+
+        cand_ws = self.candidate_sockets.get(assessment_id)
+        if cand_ws:
+            try:
+                await cand_ws.send_json({
+                    "type": "viewer_joined",
+                    "viewer_name": viewer_name,
+                    "viewers_count": len(self.active_viewers[assessment_id]),
+                })
+            except Exception:
+                pass
+
+    async def unregister_recruiter(self, assessment_id: int, websocket: WebSocket, viewer_name: str) -> None:
+        if assessment_id in self.recruiter_sockets:
+            self.recruiter_sockets[assessment_id].discard(websocket)
+            if not self.recruiter_sockets[assessment_id]:
+                del self.recruiter_sockets[assessment_id]
+        if assessment_id in self.active_viewers:
+            self.active_viewers[assessment_id].discard(viewer_name)
+            if not self.active_viewers[assessment_id]:
+                del self.active_viewers[assessment_id]
+
+        cand_ws = self.candidate_sockets.get(assessment_id)
+        if cand_ws:
+            try:
+                viewers_count = len(self.active_viewers.get(assessment_id, set()))
+                await cand_ws.send_json({
+                    "type": "viewer_left",
+                    "viewer_name": viewer_name,
+                    "viewers_count": viewers_count,
+                })
+            except Exception:
+                pass
+
+    async def broadcast_to_recruiters(
+        self,
+        assessment_id: int,
+        message: dict[str, Any],
+        sender: WebSocket | None = None,
+    ) -> None:
+        for ws in list(self.recruiter_sockets.get(assessment_id, set())):
+            if ws != sender:
+                try:
+                    await ws.send_json(message)
+                except Exception:
+                    pass
+
+    async def send_to_candidate(self, assessment_id: int, message: dict[str, Any]) -> None:
+        ws = self.candidate_sockets.get(assessment_id)
+        if ws:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                pass
+
+    def is_candidate_connected(self, assessment_id: int) -> bool:
+        return assessment_id in self.candidate_sockets
+
+    def is_camera_active(self, assessment_id: int) -> bool:
+        return self.is_candidate_connected(assessment_id) and bool(self.candidate_camera_active.get(assessment_id, False))
+
+
+live_monitoring_manager = LiveMonitoringManager()
+
+
+@app.get("/api/recruiter/live-assessments")
+def get_recruiter_live_assessments(
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    where = "WHERE x.status IN ('Started', 'Sent', 'Completed', 'Pending Recruiter Decision')"
+    params: list[Any] = []
+    if user["role"] == "recruiter":
+        where += " AND j.recruiter_id = ?"
+        params.append(user["id"])
+
+    with connect() as db:
+        rows = db.execute(
+            f"""SELECT x.id AS assessment_id, x.application_id, x.candidate_id, x.job_id,
+            x.status AS assessment_status, x.starts_at, x.expires_at, x.submitted_at,
+            x.assessment_name, x.assessment_round, x.technology,
+            j.title AS job_title, j.company, j.recruiter_id,
+            u.name AS candidate_name, u.email AS candidate_email
+            FROM assessments x
+            JOIN jobs j ON j.id = x.job_id
+            JOIN users u ON u.id = x.candidate_id
+            {where}
+            ORDER BY CASE WHEN x.status = 'Started' THEN 0 ELSE 1 END,
+                     x.starts_at DESC, x.submitted_at DESC
+            LIMIT 50""",
+            params,
+        ).fetchall()
+
+    items = []
+    for row in rows:
+        assessment_id = row["assessment_id"]
+        is_cand_online = live_monitoring_manager.is_candidate_connected(assessment_id)
+        is_cam_active = live_monitoring_manager.is_camera_active(assessment_id)
+
+        if row["assessment_status"] in ("Completed", "Pending Recruiter Decision"):
+            assessment_display = "Assessment Submitted"
+            camera_display = "Camera Disconnected"
+            monitoring_available = False
+        elif row["assessment_status"] == "Started":
+            assessment_display = "Assessment In Progress"
+            if is_cand_online and is_cam_active:
+                camera_display = "Camera Connected"
+                monitoring_available = True
+            elif is_cand_online and not is_cam_active:
+                camera_display = "Camera Disconnected"
+                monitoring_available = False
+            else:
+                camera_display = "Monitoring Unavailable"
+                monitoring_available = False
+        else:
+            assessment_display = row["assessment_status"]
+            camera_display = "Monitoring Unavailable"
+            monitoring_available = False
+
+        items.append({
+            "assessment_id": assessment_id,
+            "application_id": row["application_id"],
+            "candidate_id": row["candidate_id"],
+            "candidate_name": row["candidate_name"],
+            "candidate_email": row["candidate_email"],
+            "job_id": row["job_id"],
+            "job_title": row["job_title"],
+            "company": row["company"],
+            "assessment_name": row["assessment_name"] or "Round 1: Technical MCQ Test",
+            "assessment_round": row["assessment_round"] or "Round 1",
+            "technology": row["technology"],
+            "starts_at": row["starts_at"],
+            "expires_at": row["expires_at"],
+            "submitted_at": row["submitted_at"],
+            "assessment_status": row["assessment_status"],
+            "status": assessment_display,
+            "camera_status": camera_display,
+            "camera_connected": is_cam_active,
+            "monitoring_available": monitoring_available,
+        })
+
+    return {"items": items}
+
+
+@app.get("/api/assessments/{assessment_id}/live-status")
+def get_assessment_live_status(
+    assessment_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute(
+            """SELECT x.id, x.status, j.recruiter_id, j.title, u.name AS candidate_name
+            FROM assessments x
+            JOIN jobs j ON j.id = x.job_id
+            JOIN users u ON u.id = x.candidate_id
+            WHERE x.id = ?""",
+            (assessment_id,),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Assessment not found")
+        if user["role"] == "recruiter" and row["recruiter_id"] != user["id"]:
+            raise HTTPException(status_code=403, detail="Unauthorized to monitor this assessment")
+
+    is_online = live_monitoring_manager.is_candidate_connected(assessment_id)
+    cam_active = live_monitoring_manager.is_camera_active(assessment_id)
+
+    if row["status"] in ("Completed", "Pending Recruiter Decision"):
+        status_text = "Assessment Submitted"
+        cam_text = "Camera Disconnected"
+    elif row["status"] == "Started":
+        status_text = "Assessment In Progress"
+        cam_text = "Camera Connected" if (is_online and cam_active) else ("Camera Disconnected" if is_online else "Monitoring Unavailable")
+    else:
+        status_text = row["status"]
+        cam_text = "Monitoring Unavailable"
+
+    return {
+        "assessment_id": assessment_id,
+        "candidate_connected": is_online,
+        "camera_connected": cam_active,
+        "status": status_text,
+        "camera_status": cam_text,
+        "monitoring_available": (row["status"] == "Started" and is_online and cam_active),
+    }
+
+
+@app.websocket("/ws/live-monitoring/candidate/{token}")
+async def candidate_live_monitoring_websocket(websocket: WebSocket, token: str) -> None:
+    try:
+        with connect() as db:
+            row, error = public_assessment_for_token(db, token, allow_submitted=False)
+            if error or not row or row["status"] not in {"Started", "Sent"}:
+                await websocket.close(code=1008)
+                return
+            assessment_id = row["id"]
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    await live_monitoring_manager.register_candidate(assessment_id, websocket)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type == "camera_status":
+                is_active = bool(data.get("connected", True))
+                live_monitoring_manager.set_candidate_camera(assessment_id, is_active)
+                await live_monitoring_manager.broadcast_to_recruiters(
+                    assessment_id,
+                    {
+                        "type": "candidate_status",
+                        "connected": True,
+                        "camera_connected": is_active,
+                        "status": "Assessment In Progress" if is_active else "Camera Disconnected",
+                    },
+                )
+            elif msg_type == "webrtc_offer":
+                await live_monitoring_manager.broadcast_to_recruiters(
+                    assessment_id,
+                    {
+                        "type": "webrtc_offer",
+                        "sdp": data.get("sdp"),
+                    },
+                )
+            elif msg_type == "ice_candidate":
+                await live_monitoring_manager.broadcast_to_recruiters(
+                    assessment_id,
+                    {
+                        "type": "ice_candidate",
+                        "candidate": data.get("candidate"),
+                    },
+                )
+            elif msg_type in {"assessment_submitted", "assessment_ended"}:
+                await live_monitoring_manager.broadcast_to_recruiters(
+                    assessment_id,
+                    {
+                        "type": "candidate_status",
+                        "connected": False,
+                        "camera_connected": False,
+                        "status": "Assessment Submitted",
+                    },
+                )
+                break
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        await live_monitoring_manager.unregister_candidate(assessment_id, websocket)
+
+
+@app.websocket("/ws/live-monitoring/recruiter/{assessment_id}")
+async def recruiter_live_monitoring_websocket(
+    websocket: WebSocket,
+    assessment_id: int,
+    token: str = "",
+) -> None:
+    token = websocket_auth_token(websocket, token)
+    if not token:
+        await websocket.close(code=1008)
+        return
+    try:
+        payload = decode_token(token)
+        with connect() as db:
+            row = db.execute("SELECT * FROM users WHERE id = ?", (payload.get("sub"),)).fetchone()
+            if not row or not row["active"]:
+                await websocket.close(code=1008)
+                return
+            user = public_user(row)
+            if user["role"] not in {"recruiter", "admin"}:
+                await websocket.close(code=1008)
+                return
+
+            assessment = db.execute(
+                """SELECT x.id, x.status, j.recruiter_id, j.title, u.name as candidate_name
+                FROM assessments x
+                JOIN jobs j ON j.id = x.job_id
+                JOIN users u ON u.id = x.candidate_id
+                WHERE x.id = ?""",
+                (assessment_id,),
+            ).fetchone()
+            if not assessment:
+                await websocket.close(code=1008)
+                return
+            if user["role"] == "recruiter" and assessment["recruiter_id"] != user["id"]:
+                await websocket.close(code=1008)
+                return
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    viewer_name = user["name"]
+    await live_monitoring_manager.register_recruiter(assessment_id, websocket, viewer_name)
+    try:
+        while True:
+            data = await websocket.receive_json()
+            msg_type = data.get("type")
+            if msg_type == "request_stream":
+                await live_monitoring_manager.send_to_candidate(
+                    assessment_id,
+                    {"type": "request_offer", "requester": viewer_name},
+                )
+            elif msg_type == "webrtc_answer":
+                await live_monitoring_manager.send_to_candidate(
+                    assessment_id,
+                    {"type": "webrtc_answer", "sdp": data.get("sdp")},
+                )
+            elif msg_type == "ice_candidate":
+                await live_monitoring_manager.send_to_candidate(
+                    assessment_id,
+                    {"type": "ice_candidate", "candidate": data.get("candidate")},
+                )
+            elif msg_type == "stop_viewing":
+                break
+    except (WebSocketDisconnect, Exception):
+        pass
+    finally:
+        await live_monitoring_manager.unregister_recruiter(assessment_id, websocket, viewer_name)
+
+
+def interview_access_clause(user: dict[str, Any]) -> tuple[str, tuple[int, ...]]:
+    if user["role"] == "admin":
+        return "1 = 1", ()
+    if user["role"] == "candidate":
+        return "a.candidate_id = ?", (user["id"],)
+    return "j.recruiter_id = ?", (user["id"],)
+
+
+def validate_teams_url(teams_url: str) -> str:
+    try:
+        parsed_url = urlparse(teams_url)
+        valid = (
+            parsed_url.scheme == "https"
+            and parsed_url.hostname in {
+                "teams.microsoft.com", "teams.microsoft.us", "teams.live.com", "teams.cloud.microsoft",
+            }
+            and parsed_url.username is None
+            and parsed_url.password is None
+            and parsed_url.port in {None, 443}
+            and bool(parsed_url.path)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise HTTPException(status_code=422, detail="Provide a valid HTTPS Microsoft Teams meeting link")
+    return teams_url
+
+
+def validate_meeting_url(meeting_url: str) -> str:
+    try:
+        parsed_url = urlparse(meeting_url)
+        port = parsed_url.port
+        valid = (
+            parsed_url.scheme == "https"
+            and bool(parsed_url.hostname)
+            and not any(character.isspace() for character in parsed_url.hostname)
+            and parsed_url.username is None
+            and parsed_url.password is None
+            and (port is None or port > 0)
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise HTTPException(status_code=422, detail="Provide a valid HTTPS meeting URL")
+    return meeting_url
+
+
+def parse_interview_schedule(scheduled_at: str, timezone_name: str, *, require_future: bool = True) -> str:
+    try:
+        zone = ZoneInfo(timezone_name)
+        scheduled = datetime.fromisoformat(scheduled_at.replace("Z", "+00:00"))
+        if scheduled.tzinfo is None:
+            scheduled = scheduled.replace(tzinfo=zone)
+        scheduled = scheduled.astimezone(timezone.utc)
+    except (ValueError, ZoneInfoNotFoundError) as error:
+        raise HTTPException(status_code=422, detail="Provide a valid interview date, time, and time zone") from error
+    if require_future and scheduled <= datetime.now(timezone.utc):
+        raise HTTPException(status_code=422, detail="Interview date and time must be in the future")
+    return scheduled.isoformat()
+
+
+def interview_notification_message(interview: dict[str, Any], action: str) -> str:
+    scheduled = datetime.fromisoformat(interview["scheduled_at"].replace("Z", "+00:00"))
+    scheduled = scheduled.astimezone(ZoneInfo(interview["timezone"]))
+    schedule_label = scheduled.strftime("%d %B %Y, %I:%M %p")
+    if action == "scheduled":
+        status_message = f"is scheduled for {schedule_label}"
+    elif action == "rescheduled":
+        status_message = f"has been rescheduled to {schedule_label}"
+    elif action == "cancelled":
+        status_message = f"scheduled for {schedule_label} has been cancelled"
+    elif action == "completed":
+        status_message = f"scheduled for {schedule_label} has been marked completed"
+    else:
+        status_message = f"details were updated; the interview is scheduled for {schedule_label}"
+    message = (
+        f"Your interview for {interview['title']} at {interview['company']} {status_message} "
+        f"({interview['timezone']}).\n"
+        f"Duration: {interview['duration_minutes']} minutes.\n"
+        f"Meeting platform: {interview['meeting_platform']}."
+    )
+    if interview["recruiter_message"]:
+        message += f"\nRecruiter instructions: {interview['recruiter_message']}"
+    if interview["status"] in {"Scheduled", "Rescheduled"} and interview["meeting_url"]:
+        message += f"\nSecure meeting link: {interview['meeting_url']}"
+    return message
+
+
+def notify_interview_candidate(
+    db: sqlite3.Connection,
+    interview: dict[str, Any],
+    notification_type: str,
+    title: str,
+    action: str,
+) -> None:
+    notify_user(
+        db,
+        interview["candidate_id"],
+        notification_type,
+        title,
+        interview_notification_message(interview, action),
+        application_id=interview["application_id"],
+        email=True,
+        action_url="/",
+    )
+
+
+def public_interview(
+    interview: sqlite3.Row | dict[str, Any],
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    result = dict(interview)
+    if user["role"] == "candidate" and result["status"] in {"Cancelled", "Completed"}:
+        result["meeting_url"] = ""
+        result["teams_url"] = ""
+    return result
+
+
+def interview_details(db: sqlite3.Connection, interview_id: int, user: dict[str, Any]) -> sqlite3.Row:
+    access_clause, access_values = interview_access_clause(user)
+    row = db.execute(
+        f"""SELECT i.id, i.application_id, i.recruiter_id, i.scheduled_at, i.teams_url,
+            COALESCE(NULLIF(i.meeting_url, ''), i.teams_url) AS meeting_url,
+            i.meeting_platform, i.duration_minutes, i.timezone, i.recruiter_message,
+            i.status, i.invitation_sent_at, i.candidate_viewed_at,
+            i.code, i.language, i.created_at, i.updated_at, a.candidate_id, a.job_id,
+            candidate.name AS candidate_name, j.title, j.company,
+            recruiter.name AS recruiter_name
+            FROM interviews i
+            JOIN applications a ON a.id = i.application_id
+            JOIN users candidate ON candidate.id = a.candidate_id
+            JOIN users recruiter ON recruiter.id = i.recruiter_id
+            JOIN jobs j ON j.id = a.job_id
+            WHERE i.id = ? AND {access_clause}""",
+        (interview_id, *access_values),
+    ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Interview not found")
+    return row
+
+
+@app.get("/api/interviews")
+def list_interviews(user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    access_clause, access_values = interview_access_clause(user)
+    with connect() as db:
+        rows = db.execute(
+            f"""SELECT i.id, i.application_id, i.recruiter_id, i.scheduled_at, i.teams_url,
+                COALESCE(NULLIF(i.meeting_url, ''), i.teams_url) AS meeting_url,
+                i.meeting_platform, i.duration_minutes, i.timezone, i.recruiter_message,
+                i.status, i.invitation_sent_at, i.candidate_viewed_at,
+                i.language, i.created_at, i.updated_at, a.candidate_id, a.job_id,
+                candidate.name AS candidate_name, j.title, j.company,
+                recruiter.name AS recruiter_name
+                FROM interviews i
+                JOIN applications a ON a.id = i.application_id
+                JOIN users candidate ON candidate.id = a.candidate_id
+                JOIN users recruiter ON recruiter.id = i.recruiter_id
+                JOIN jobs j ON j.id = a.job_id
+                WHERE {access_clause}
+                ORDER BY i.scheduled_at ASC, i.id ASC""",
+            access_values,
+        ).fetchall()
+    return {"items": [public_interview(row, user) for row in rows]}
+
+
+def create_interview_invitation(
+    db: sqlite3.Connection,
+    application_id: int,
+    body: InterviewInvitationBody,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    scheduled_at = parse_interview_schedule(body.scheduled_at, body.timezone)
+    meeting_url = validate_meeting_url(body.meeting_url)
+    application = db.execute(
+        """SELECT a.id, a.status, a.candidate_id, j.id AS job_id, j.title, j.company,
+        j.recruiter_id FROM applications a JOIN jobs j ON j.id = a.job_id
+        WHERE a.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+        (application_id, user["role"], user["id"]),
+    ).fetchone()
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found for your job listings")
+    if application["status"] in {"Rejected", "Withdrawn", "Accepted", "Selected"}:
+        raise HTTPException(status_code=409, detail="This application cannot be scheduled for an interview")
+    timestamp = now()
+    cursor = db.execute(
+        """INSERT INTO interviews
+        (application_id, recruiter_id, scheduled_at, teams_url, meeting_platform, meeting_url,
+         duration_minutes, timezone, recruiter_message, status, invitation_sent_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Scheduled', ?, ?, ?)""",
+        (
+        application["id"], application["recruiter_id"], scheduled_at,
+        meeting_url if body.meeting_platform == "Microsoft Teams" else "",
+        body.meeting_platform, meeting_url, body.duration_minutes, body.timezone,
+        body.recruiter_message, timestamp, timestamp, timestamp,
+        ),
+    )
+    if application["status"] != "Interview":
+        db.execute("UPDATE applications SET status = 'Interview' WHERE id = ?", (application["id"],))
+    record_application_status(
+        db, application["id"], "Interview", user,
+        f"Interview scheduled for {scheduled_at}.",
+    )
+    interview = dict(interview_details(db, cursor.lastrowid, user))
+    notify_interview_candidate(
+        db, interview, "interview_scheduled", "Interview scheduled", "scheduled"
+    )
+    return interview
+
+
+@app.post("/api/applications/{application_id}/interviews", status_code=201)
+def schedule_application_interview(
+    application_id: int,
+    body: InterviewInvitationBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    with connect() as db:
+        interview = create_interview_invitation(db, application_id, body, user)
+    return public_interview(interview, user)
+
+
+@app.patch("/api/applications/{application_id}/interviews/{interview_id}")
+def update_application_interview(
+    application_id: int,
+    interview_id: int,
+    body: InterviewUpdateBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    updates = body.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail="Provide at least one interview detail to update")
+    if "meeting_url" in updates:
+        updates["meeting_url"] = validate_meeting_url(updates["meeting_url"])
+    try:
+        with connect() as db:
+            interview_row = interview_details(db, interview_id, user)
+            if interview_row["application_id"] != application_id:
+                raise HTTPException(status_code=404, detail="Interview not found for this application")
+            if interview_row["status"] in {"Cancelled", "Completed"}:
+                raise HTTPException(status_code=409, detail="This interview can no longer be changed")
+            if "scheduled_at" in updates:
+                timezone_name = updates.get("timezone", interview_row["timezone"])
+                updates["scheduled_at"] = parse_interview_schedule(updates["scheduled_at"], timezone_name)
+                updates["timezone"] = timezone_name
+            elif "timezone" in updates:
+                try:
+                    ZoneInfo(updates["timezone"])
+                except ZoneInfoNotFoundError as error:
+                    raise HTTPException(status_code=422, detail="Provide a valid time zone") from error
+            rescheduled = (
+                "scheduled_at" in updates
+                and updates["scheduled_at"] != interview_row["scheduled_at"]
+            )
+            link_changed = (
+                "meeting_url" in updates
+                and updates["meeting_url"] != interview_row["meeting_url"]
+            )
+            if "meeting_url" in updates:
+                updates["teams_url"] = (
+                    updates["meeting_url"]
+                    if updates.get("meeting_platform", interview_row["meeting_platform"]) == "Microsoft Teams"
+                    else ""
+                )
+            elif "meeting_platform" in updates:
+                updates["teams_url"] = (
+                    interview_row["meeting_url"] if updates["meeting_platform"] == "Microsoft Teams" else ""
+                )
+            if rescheduled:
+                updates["status"] = "Rescheduled"
+            updates["invitation_sent_at"] = now()
+            updates["updated_at"] = now()
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            db.execute(
+                f"UPDATE interviews SET {assignments} WHERE id = ?",
+                (*updates.values(), interview_id),
+            )
+            updated = dict(interview_details(db, interview_id, user))
+            record_application_status(
+                db, application_id, "Interview", user,
+                "Interview rescheduled." if rescheduled else "Interview details updated.",
+            )
+            notification_type = (
+                "interview_rescheduled" if rescheduled
+                else "interview_link_changed" if link_changed
+                else "interview_updated"
+            )
+            notification_title = (
+                "Interview rescheduled" if rescheduled
+                else "Interview link changed" if link_changed
+                else "Interview details updated"
+            )
+            notify_interview_candidate(
+                db,
+                updated,
+                notification_type,
+                notification_title,
+                "rescheduled" if rescheduled else "updated",
+            )
+    except sqlite3.IntegrityError as error:
+        raise HTTPException(status_code=409, detail="Interview details could not be saved") from error
+    return public_interview(updated, user)
+
+
+def change_interview_status(
+    application_id: int,
+    interview_id: int,
+    status: str,
+    user: dict[str, Any],
+) -> dict[str, Any]:
+    with connect() as db:
+        interview_row = interview_details(db, interview_id, user)
+        if interview_row["application_id"] != application_id:
+            raise HTTPException(status_code=404, detail="Interview not found for this application")
+        if interview_row["status"] in {"Cancelled", "Completed"}:
+            raise HTTPException(status_code=409, detail="This interview is already closed")
+        db.execute(
+            "UPDATE interviews SET status = ?, updated_at = ? WHERE id = ?",
+            (status, now(), interview_id),
+        )
+        updated = dict(interview_details(db, interview_id, user))
+        record_application_status(
+            db, application_id, "Interview", user,
+            f"Interview {status.lower()}.",
+        )
+        notify_interview_candidate(
+            db,
+            updated,
+            f"interview_{status.lower()}",
+            f"Interview {status.lower()}",
+            status.lower(),
+        )
+    return public_interview(updated, user)
+
+
+@app.post("/api/applications/{application_id}/interviews/{interview_id}/cancel")
+def cancel_application_interview(
+    application_id: int,
+    interview_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    return change_interview_status(application_id, interview_id, "Cancelled", user)
+
+
+@app.post("/api/applications/{application_id}/interviews/{interview_id}/complete")
+def complete_application_interview(
+    application_id: int,
+    interview_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    return change_interview_status(application_id, interview_id, "Completed", user)
+
+
+@app.get("/api/interviews/upcoming")
+def upcoming_interviews(
+    user: dict[str, Any] = Depends(require_role("candidate")),
+) -> dict[str, Any]:
+    with connect() as db:
+        rows = db.execute(
+            """SELECT i.id, i.application_id, i.scheduled_at, i.meeting_platform,
+            COALESCE(NULLIF(i.meeting_url, ''), i.teams_url) AS meeting_url,
+            i.duration_minutes, i.timezone, i.recruiter_message, i.status,
+            j.title, j.company
+            FROM interviews i JOIN applications a ON a.id = i.application_id
+            JOIN jobs j ON j.id = a.job_id
+            WHERE a.candidate_id = ? AND i.status IN ('Scheduled', 'Rescheduled')
+            AND i.scheduled_at > ? ORDER BY i.scheduled_at ASC, i.id ASC""",
+            (user["id"], now()),
+        ).fetchall()
+    return {"items": [dict(row) for row in rows]}
+
+
+@app.post("/api/interviews/{interview_id}/viewed")
+def mark_interview_viewed(
+    interview_id: int,
+    user: dict[str, Any] = Depends(require_role("candidate")),
+) -> dict[str, str]:
+    with connect() as db:
+        interview_details(db, interview_id, user)
+        viewed_at = now()
+        db.execute(
+            "UPDATE interviews SET candidate_viewed_at = COALESCE(candidate_viewed_at, ?) WHERE id = ?",
+            (viewed_at, interview_id),
+        )
+        result = db.execute(
+            "SELECT candidate_viewed_at FROM interviews WHERE id = ?", (interview_id,)
+        ).fetchone()
+    return {"candidate_viewed_at": result["candidate_viewed_at"]}
+
+
+@app.post("/api/interviews", status_code=201)
+def create_interview(
+    body: InterviewBody,
+    user: dict[str, Any] = Depends(require_role("recruiter")),
+) -> dict[str, Any]:
+    try:
+        scheduled = datetime.fromisoformat(body.scheduled_at.replace("Z", "+00:00"))
+        if scheduled.tzinfo is None:
+            raise ValueError("Timezone is required")
+        scheduled_at = scheduled.astimezone(timezone.utc).isoformat()
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail="Provide an interview date and time with a timezone") from error
+    teams_url = validate_teams_url(body.teams_url)
+    with connect() as db:
+        application = db.execute(
+            """SELECT a.id, a.status, a.candidate_id, j.title, j.company, j.recruiter_id
+            FROM applications a JOIN jobs j ON j.id = a.job_id
+            WHERE a.id = ? AND j.recruiter_id = ?""",
+            (body.application_id, user["id"]),
+        ).fetchone()
+        if not application:
+            raise HTTPException(status_code=404, detail="Application not found for your job listings")
+        if application["status"] in {"Rejected", "Withdrawn", "Accepted", "Selected"}:
+            raise HTTPException(status_code=409, detail="This application cannot be scheduled for an interview")
+        timestamp = now()
+        cursor = db.execute(
+            """INSERT INTO interviews
+            (application_id, recruiter_id, scheduled_at, teams_url, meeting_platform, meeting_url,
+             duration_minutes, timezone, status, invitation_sent_at, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'Microsoft Teams', ?, 60, 'UTC', 'Scheduled', ?, ?, ?)""",
+            (application["id"], user["id"], scheduled_at, teams_url, teams_url, timestamp, timestamp, timestamp),
+        )
+        db.execute("UPDATE applications SET status = 'Interview' WHERE id = ?", (application["id"],))
+        record_application_status(
+            db, application["id"], "Interview", user, f"Interview scheduled for {scheduled_at}."
+        )
+        interview = dict(interview_details(db, cursor.lastrowid, user))
+        notify_interview_candidate(
+            db, interview, "interview_scheduled", "Interview scheduled", "scheduled"
+        )
+    return interview
+
+
+@app.get("/api/interviews/{interview_id}")
+def get_interview(
+    interview_id: int,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    with connect() as db:
+        interview = interview_details(db, interview_id, user)
+    return public_interview(interview, user)
+
+
+class InterviewConnectionManager:
+    def __init__(self) -> None:
+        self.active_rooms: dict[int, set[WebSocket]] = {}
+
+    async def connect(self, interview_id: int, websocket: WebSocket) -> None:
+        await websocket.accept()
+        if interview_id not in self.active_rooms:
+            self.active_rooms[interview_id] = set()
+        self.active_rooms[interview_id].add(websocket)
+
+    def disconnect(self, interview_id: int, websocket: WebSocket) -> None:
+        if interview_id in self.active_rooms:
+            self.active_rooms[interview_id].discard(websocket)
+            if not self.active_rooms[interview_id]:
+                del self.active_rooms[interview_id]
+
+    async def broadcast(self, interview_id: int, message: dict[str, Any], sender: WebSocket | None = None) -> None:
+        for connection in list(self.active_rooms.get(interview_id, set())):
+            if connection != sender:
+                try:
+                    await connection.send_json(message)
+                except Exception:
+                    pass
+
+
+interview_manager = InterviewConnectionManager()
+
+
+@app.put("/api/interviews/{interview_id}/workspace")
+async def update_interview_workspace(
+    interview_id: int,
+    body: InterviewWorkspaceBody,
+    user: dict[str, Any] = Depends(current_user),
+) -> dict[str, Any]:
+    if user["role"] not in {"candidate", "recruiter"}:
+        raise HTTPException(status_code=403, detail="This action is not available for your account")
+    with connect() as db:
+        interview_details(db, interview_id, user)
+        updated_at = now()
+        db.execute(
+            "UPDATE interviews SET code = ?, language = ?, updated_at = ? WHERE id = ?",
+            (body.code, body.language, updated_at, interview_id),
+        )
+        interview = interview_details(db, interview_id, user)
+    # Broadcast to active WebSockets in this room
+    await interview_manager.broadcast(
+        interview_id,
+        {"type": "code_change", "code": body.code, "language": body.language, "sender": user["name"]},
+    )
+    return dict(interview)
+
+
+@app.websocket("/ws/interviews/{interview_id}")
+async def interview_websocket(websocket: WebSocket, interview_id: int, token: str = "") -> None:
+    try:
+        token = websocket_auth_token(websocket, token)
+        if not token:
+            await websocket.close(code=1008)
+            return
+        payload = decode_token(token)
+        with connect() as db:
+            row = db.execute("SELECT * FROM users WHERE id = ?", (payload.get("sub"),)).fetchone()
+            if not row or not row["active"]:
+                await websocket.close(code=1008)
+                return
+            user = public_user(row)
+            interview = interview_details(db, interview_id, user)
+    except Exception:
+        await websocket.close(code=1008)
+        return
+
+    await interview_manager.connect(interview_id, websocket)
+    try:
+        await websocket.send_json({
+            "type": "sync",
+            "code": interview["code"] or "",
+            "language": interview["language"] or "python",
+        })
+        while True:
+            data = await websocket.receive_json()
+            if data.get("type") == "code_change":
+                new_code = str(data.get("code", ""))[:50_000]
+                new_lang = str(data.get("language", "python"))
+                if new_lang not in {"python", "javascript", "typescript", "java", "cpp"}:
+                    new_lang = "python"
+                with connect() as db:
+                    db.execute(
+                        "UPDATE interviews SET code = ?, language = ?, updated_at = ? WHERE id = ?",
+                        (new_code, new_lang, now(), interview_id),
+                    )
+                await interview_manager.broadcast(
+                    interview_id,
+                    {"type": "code_change", "code": new_code, "language": new_lang, "sender": user["name"]},
+                    sender=websocket,
+                )
+    except (WebSocketDisconnect, Exception):
+        interview_manager.disconnect(interview_id, websocket)
+
+
+@app.patch("/api/applications/{application_id}/withdraw")
+def withdraw_application(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("candidate")),
+) -> dict[str, Any]:
+    withdrawable = {"Applied", "Under Review", "Shortlisted", "Assessment Sent", "Assessment Started"}
+    with connect() as db:
+        row = db.execute(
+            "SELECT id, status FROM applications WHERE id = ? AND candidate_id = ?",
+            (application_id, user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Application not found")
+        if row["status"] not in withdrawable:
+            raise HTTPException(status_code=409, detail="This application can no longer be withdrawn")
+        db.execute("UPDATE applications SET status = 'Withdrawn' WHERE id = ?", (application_id,))
+        record_application_status(db, application_id, "Withdrawn", user)
+        db.execute(
+            """UPDATE assessments SET token_hash = NULL,
+            status = CASE WHEN status = 'Completed' THEN status ELSE 'Expired' END
+            WHERE application_id = ?""",
+            (application_id,),
+        )
+        job = db.execute(
+            """SELECT j.title, j.recruiter_id FROM applications a JOIN jobs j ON j.id = a.job_id
+            WHERE a.id = ?""",
+            (application_id,),
+        ).fetchone()
+        if job:
+            notify_user(
+                db, job["recruiter_id"], "application_withdrawn", "Candidate withdrew",
+                f"A candidate withdrew from {job['title']}.", application_id=application_id,
+            )
+    return {"id": application_id, "status": "Withdrawn"}
+
+
+@app.put("/api/applications/{application_id}/status")
+@app.patch("/api/applications/{application_id}/status", include_in_schema=False)
+def update_application_status(
+    application_id: int,
+    body: ApplicationStatusBody,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> dict[str, Any]:
+    allowed = {
+        "Applied", "Under Review", "Shortlisted", "Assessment Sent", "Assessment Started",
+        "Assessment Completed", "Assessment Expired", "Round 1 Passed", "Round 1 Failed",
+        "Interview", "Accepted", "Selected", "Rejected",
+    }
+    if body.status not in allowed:
+        raise HTTPException(status_code=422, detail="Choose a valid application status")
+    new_status = "Accepted" if body.status == "Selected" else body.status
+    transitions = {
+        "Applied": {"Under Review", "Shortlisted", "Interview", "Rejected"},
+        "Under Review": {"Shortlisted", "Interview", "Rejected"},
+        "Shortlisted": {"Assessment Sent", "Interview", "Accepted", "Rejected"},
+        "Assessment Sent": {"Assessment Started", "Assessment Expired", "Interview", "Accepted", "Rejected"},
+        "Assessment Started": {"Assessment Completed", "Assessment Expired", "Interview", "Rejected"},
+        "Assessment Completed": {"Round 1 Passed", "Round 1 Failed", "Interview", "Accepted", "Rejected"},
+        "Assessment Expired": {"Assessment Sent", "Interview", "Accepted", "Rejected"},
+        "Round 1 Passed": {"Interview", "Accepted", "Rejected"},
+        "Round 1 Failed": {"Accepted", "Rejected"},
+        "Interview": {"Accepted", "Rejected"},
+        "Accepted": set(),
+        "Rejected": set(),
+        "Withdrawn": set(),
+        "Selected": {"Accepted", "Rejected"},
+    }
+    with connect() as db:
+        row = db.execute(
+            """SELECT a.id, a.status, a.candidate_id, u.email AS candidate_email,
+            j.title, j.recruiter_id FROM applications a JOIN jobs j ON j.id = a.job_id
+            JOIN users u ON u.id = a.candidate_id
+            WHERE a.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+            (application_id, user["role"], user["id"]),
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Application not found for your job listings")
+        if new_status != row["status"] and new_status not in transitions.get(row["status"], set()):
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot move an application from {row['status']} to {new_status}",
+            )
+        assessment_stage = {
+            "Assessment Sent": "Sent",
+            "Assessment Started": "Started",
+            "Assessment Completed": "Completed",
+            "Assessment Expired": "Expired",
+        }
+        if new_status != row["status"] and new_status in assessment_stage:
+            assessment = db.execute(
+                "SELECT status FROM assessments WHERE application_id = ?", (application_id,)
+            ).fetchone()
+            if not assessment or assessment["status"] != assessment_stage[new_status]:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Assessment pipeline stages are updated automatically by assessment activity",
+                )
+        if new_status in {"Round 1 Passed", "Round 1 Failed"} and new_status != row["status"]:
+            assessment = db.execute(
+                "SELECT id, recruiter_decision FROM assessments WHERE application_id = ?", (application_id,)
+            ).fetchone()
+            decision_val = "Passed" if new_status == "Round 1 Passed" else "Failed"
+            if assessment:
+                db.execute(
+                    """UPDATE assessments SET recruiter_decision = ?, recruiter_decision_at = ?,
+                    recruiter_decision_by = ?, status = 'Completed' WHERE id = ?""",
+                    (decision_val, now(), user["id"], assessment["id"]),
+                )
+        db.execute("UPDATE applications SET status = ? WHERE id = ?", (new_status, application_id))
+        if new_status != row["status"]:
+            record_application_status(db, application_id, new_status, user, body.note)
+            notify_user(
+                db, row["candidate_id"], "application_status", f"Application status: {new_status}",
+                f"Your application for {row['title']} is now {new_status}.",
+                application_id=application_id, email=True,
+            )
+        if new_status in {"Rejected", "Accepted"}:
+            db.execute(
+                """UPDATE assessments SET token_hash = NULL,
+                status = CASE WHEN status IN ('Completed', 'Pending Recruiter Decision') THEN status ELSE 'Expired' END
+                WHERE application_id = ?""",
+                (application_id,),
+            )
+    return {"id": row["id"], "status": new_status}
+
+
+@app.get("/api/applications/{application_id}/resume")
+def download_application_resume(
+    application_id: int,
+    user: dict[str, Any] = Depends(require_role("recruiter", "admin")),
+) -> FileResponse:
+    with connect() as db:
+        row = db.execute(
+            """SELECT r.storage_path, r.filename, r.content_type FROM applications a
+            JOIN jobs j ON j.id = a.job_id JOIN resumes r ON r.id = a.resume_id
+            WHERE a.id = ? AND (? = 'admin' OR j.recruiter_id = ?)""",
+            (application_id, user["role"], user["id"]),
+        ).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Resume not found for your job listings")
+    path = Path(row["storage_path"]).resolve()
+    if not path.is_relative_to(UPLOAD_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Resume file is unavailable")
+    return FileResponse(path, filename=row["filename"], media_type=row["content_type"])
+
+
+@app.post("/api/resume/upload", status_code=201)
+async def upload_resume(
+    file: UploadFile = File(...),
+    user: dict[str, Any] = Depends(require_role("candidate")),
+) -> dict[str, Any]:
+    content = await file.read(MAX_RESUME_BYTES + 1)
+    if not content:
+        raise HTTPException(status_code=422, detail="This file is empty")
+    if len(content) > MAX_RESUME_BYTES:
+        raise HTTPException(status_code=413, detail="Resume must be 10 MB or smaller")
+    name = Path(file.filename or "resume").name
+    suffix = Path(name).suffix.lower()
+    mime_by_suffix = {".pdf": "application/pdf", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"}
+    expected_type = mime_by_suffix.get(suffix)
+    if not expected_type:
+        raise HTTPException(status_code=415, detail="Use a PDF, JPG, JPEG, or PNG resume")
+    if expected_type == "application/pdf" and b"%PDF-" not in content[:1024]:
+        raise HTTPException(status_code=415, detail="This file does not contain a valid PDF")
+    if expected_type == "application/pdf":
+        import io
+        from pypdf import PdfReader
+        
+        try:
+            reader = PdfReader(io.BytesIO(content), strict=True)
+        
+            # Check whether the PDF contains readable pages
+            if reader.is_encrypted:
+                raise ValueError("Encrypted PDF")
+        
+            if len(reader.pages) == 0:
+                raise ValueError("PDF has no pages")
+        
+        except Exception as error:
+            raise HTTPException(
+                status_code=422,
+                detail="This PDF is corrupted or unreadable."
+            ) from error
+    
+
+    
+
+    if expected_type == "image/jpeg" and not content.startswith(b"\xff\xd8\xff"):
+        raise HTTPException(status_code=415, detail="This file does not contain a valid JPEG image")
+    if expected_type == "image/png" and not content.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise HTTPException(status_code=415, detail="This file does not contain a valid PNG image")
+    storage_path = UPLOAD_DIR / f"{uuid.uuid4().hex}{suffix}"
+    status = "completed"
+    processing_error = ""
+    try:
+        text = await run_in_threadpool(extract_resume_text, content, expected_type)
+        if not text:
+            status = "needs_review"
+            processing_error = "No readable text was found. Try a clearer, text-based PDF or image."
+    except HTTPException:
+        raise
+    except Exception as error:
+        text = ""
+        status = "needs_review"
+        if error.__class__.__name__ == "TesseractNotFoundError":
+            processing_error = "Resume uploaded, but OCR is unavailable. Install Tesseract OCR and try again."
+        elif expected_type == "application/pdf":
+            processing_error = f"Resume uploaded, but text could not be extracted: {error.__class__.__name__}. Try a text-based PDF."
+        else:
+            processing_error = f"Resume uploaded, but text could not be extracted: {error.__class__.__name__}. Try a clearer image."
+    storage_path.write_bytes(content)
+    profile = detect_profile(text)
+    try:
+        with connect() as db:
+            old = db.execute("SELECT storage_path FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+            cursor = db.execute(
+                """INSERT INTO resumes
+                (candidate_id, filename, storage_path, content_type, extracted_text, parsed_profile_json, processing_status, processing_error, uploaded_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(candidate_id) DO UPDATE SET
+                filename = excluded.filename, storage_path = excluded.storage_path, content_type = excluded.content_type,
+                extracted_text = excluded.extracted_text, parsed_profile_json = excluded.parsed_profile_json,
+                processing_status = excluded.processing_status, processing_error = excluded.processing_error,
+                uploaded_at = excluded.uploaded_at""",
+                (user["id"], name, str(storage_path), expected_type, text, json.dumps(profile), status, processing_error, now()),
+            )
+            row = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+        if old:
+            old_path = Path(old["storage_path"])
+            if old_path != storage_path and old_path.is_file():
+                old_path.unlink()
+    except Exception:
+        storage_path.unlink(missing_ok=True)
+        raise
+    finally:
+        await file.close()
+    return public_resume(row)
+
+
+@app.get("/api/resume")
+def get_resume(user: dict[str, Any] = Depends(require_role("candidate"))) -> dict[str, Any] | None:
+    with connect() as db:
+        row = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+    if not row:
+        return None
+    return public_resume(row)
+
+
+@app.get("/api/resume/profile")
+def resume_profile(user: dict[str, Any] = Depends(require_role("candidate"))) -> dict[str, Any]:
+    with connect() as db:
+        row = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No resume found")
+    return public_resume(row)
+
+
+@app.get("/api/resume/download")
+def download_resume(user: dict[str, Any] = Depends(require_role("candidate"))) -> FileResponse:
+    with connect() as db:
+        row = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="No resume found")
+    path = Path(row["storage_path"]).resolve()
+    if not path.is_relative_to(UPLOAD_DIR.resolve()) or not path.is_file():
+        raise HTTPException(status_code=404, detail="Resume file is unavailable")
+    return FileResponse(path, filename=row["filename"], media_type=row["content_type"])
+
+
+@app.get("/api/matches/{job_id}")
+def match_job(job_id: int, user: dict[str, Any] = Depends(require_role("candidate"))) -> dict[str, Any]:
+    with connect() as db:
+        job = db.execute("SELECT * FROM jobs WHERE id = ? AND status = 'Open'", (job_id,)).fetchone()
+        resume = db.execute("SELECT * FROM resumes WHERE candidate_id = ?", (user["id"],)).fetchone()
+        saved_profile = db.execute("SELECT profile_json FROM users WHERE id = ?", (user["id"],)).fetchone()
+    if not job:
+        raise HTTPException(status_code=404, detail="This role is no longer available")
+    if not resume:
+        raise HTTPException(status_code=409, detail="Upload a resume to see your match")
+    return calculate_match(job, resume, saved_profile["profile_json"])
+
+
+@app.post("/api/resume/analyze")
+def analyze_resume(
+    body: MatchBody,
+    user: dict[str, Any] = Depends(require_role("candidate")),
+) -> dict[str, Any]:
+    return match_job(body.job_id, user)
+
+
+@app.get("/api/recruiter/applicants")
+def recruiter_applicants(user: dict[str, Any] = Depends(require_role("recruiter"))) -> dict[str, Any]:
+    return list_applications(user)
+
+
+@app.patch("/api/profile")
+def update_profile(body: ProfileBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    profile = dict(body.profile)
+    profile.pop("email", None)
+    if len(json.dumps(profile, ensure_ascii=False)) > 8_000:
+        raise HTTPException(status_code=422, detail="Profile details must be 8 KB or smaller")
+    with connect() as db:
+        db.execute("UPDATE users SET name = ?, profile_json = ? WHERE id = ?", (body.name.strip(), json.dumps(profile), user["id"]))
+        row = db.execute("SELECT * FROM users WHERE id = ?", (user["id"],)).fetchone()
+    return public_user(row)
+
+
+@app.get("/api/admin/jobs")
+def admin_jobs(user: dict[str, Any] = Depends(require_role("admin"))) -> dict[str, Any]:
+    del user
+    with connect() as db:
+        rows = db.execute("SELECT * FROM jobs ORDER BY created_at DESC, id ASC LIMIT 500").fetchall()
+    return {"items": [public_job(row) for row in rows]}
+
+
+@app.patch("/api/admin/jobs/{job_id}/status")
+def update_job_status(
+    job_id: int,
+    body: JobStatusBody,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    del user
+    if body.status not in {"Open", "Closed"}:
+        raise HTTPException(status_code=422, detail="Choose Open or Closed")
+    with connect() as db:
+        result = db.execute("UPDATE jobs SET status = ? WHERE id = ?", (body.status, job_id))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Job listing not found")
+    return {"id": job_id, "status": body.status}
+
+
+@app.patch("/api/admin/users/{user_id}/status")
+def update_user_status(
+    user_id: int,
+    body: UserStatusBody,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    if user_id == user["id"] and not body.active:
+        raise HTTPException(status_code=409, detail="You cannot disable your own admin account")
+    with connect() as db:
+        result = db.execute("UPDATE users SET active = ? WHERE id = ?", (int(body.active), user_id))
+        if result.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Account not found")
+    return {"id": user_id, "active": body.active}
+
+
+@app.get("/api/admin/analytics")
+def analytics(
+    report_range: str = "this_week",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    user: dict[str, Any] = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    today = datetime.now(timezone.utc).date()
+    monday = today - timedelta(days=today.weekday())
+    if report_range == "this_week":
+        start, end = monday, monday + timedelta(days=7)
+    elif report_range == "last_week":
+        start, end = monday - timedelta(days=7), monday
+    elif report_range == "this_month":
+        start = today.replace(day=1)
+        next_month = (start + timedelta(days=32)).replace(day=1)
+        end = next_month
+    elif report_range == "last_month":
+        this_month_start = today.replace(day=1)
+        end = this_month_start
+        start = (this_month_start - timedelta(days=1)).replace(day=1)
+    elif report_range == "custom":
+        try:
+            start = date.fromisoformat(start_date or "")
+            end = date.fromisoformat(end_date or "") + timedelta(days=1)
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail="Custom reports need valid start_date and end_date values") from error
+        if end <= start:
+            raise HTTPException(status_code=422, detail="end_date must be on or after start_date")
+    else:
+        raise HTTPException(status_code=422, detail="Choose this_week, last_week, this_month, last_month, or custom")
+
+    range_start = datetime.combine(start, datetime.min.time(), timezone.utc).isoformat()
+    range_end = datetime.combine(end, datetime.min.time(), timezone.utc).isoformat()
+    with connect() as db:
+        counts = {
+            "users": db.execute("SELECT COUNT(*) FROM users").fetchone()[0],
+            "candidates": db.execute("SELECT COUNT(*) FROM users WHERE role = 'candidate'").fetchone()[0],
+            "recruiters": db.execute("SELECT COUNT(*) FROM users WHERE role = 'recruiter'").fetchone()[0],
+            "jobs": db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0],
+            "open_jobs": db.execute("SELECT COUNT(*) FROM jobs WHERE status = 'Open'").fetchone()[0],
+            "applications": db.execute("SELECT COUNT(*) FROM applications").fetchone()[0],
+            "resumes": db.execute("SELECT COUNT(*) FROM resumes").fetchone()[0],
+            "in_review": db.execute("SELECT COUNT(*) FROM applications WHERE status = 'Under Review'").fetchone()[0],
+        }
+        applications_in_range = db.execute(
+            """SELECT COUNT(*) FROM applications
+            WHERE applied_at >= ? AND applied_at < ?""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        assessment_counts = {
+            row["status"]: row["amount"]
+            for row in db.execute(
+                """SELECT status, COUNT(*) AS amount FROM assessments
+                WHERE created_at >= ? AND created_at < ? GROUP BY status""",
+                (range_start, range_end),
+            )
+        }
+        sent_count = db.execute(
+            """SELECT COUNT(*) FROM assessments
+            WHERE email_sent_at >= ? AND email_sent_at < ?""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        sent_completed_count = db.execute(
+            """SELECT COUNT(*) FROM assessments
+            WHERE email_sent_at >= ? AND email_sent_at < ? AND status = 'Completed'""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        completed_count = db.execute(
+            """SELECT COUNT(*) FROM assessments
+            WHERE submitted_at >= ? AND submitted_at < ? AND status = 'Completed'""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        average_score = db.execute(
+            """SELECT AVG(CAST(score AS REAL) / NULLIF(total_questions, 0) * 100)
+            FROM assessments WHERE submitted_at >= ? AND submitted_at < ? AND status = 'Completed'""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        round1_counts = {
+            row["result"]: row["amount"]
+            for row in db.execute(
+                """SELECT result, COUNT(*) AS amount FROM assessments
+                WHERE assessment_round = 'Round 1' AND submitted_at >= ? AND submitted_at < ?
+                AND result IN ('Passed', 'Failed') GROUP BY result""",
+                (range_start, range_end),
+            )
+        }
+        round1_completed = sum(round1_counts.values())
+        round1_average = db.execute(
+            """SELECT AVG(score_percentage) FROM assessments
+            WHERE assessment_round = 'Round 1' AND submitted_at >= ? AND submitted_at < ?
+            AND result IN ('Passed', 'Failed')""",
+            (range_start, range_end),
+        ).fetchone()[0]
+        round1_job_results = [
+            dict(row) for row in db.execute(
+                """SELECT j.id AS job_id, j.title, j.company, x.result, COUNT(*) AS candidates
+                FROM assessments x JOIN jobs j ON j.id = x.job_id
+                WHERE x.assessment_round = 'Round 1' AND x.submitted_at >= ? AND x.submitted_at < ?
+                AND x.result IN ('Passed', 'Failed')
+                GROUP BY j.id, x.result ORDER BY j.title, x.result""",
+                (range_start, range_end),
+            )
+        ]
+        daily_rows = db.execute(
+            """SELECT substr(applied_at, 1, 10) AS day, COUNT(*) AS amount
+            FROM applications WHERE applied_at >= ? AND applied_at < ?
+            GROUP BY substr(applied_at, 1, 10)""",
+            (range_start, range_end),
+        ).fetchall()
+        daily_counts = {row["day"]: row["amount"] for row in daily_rows}
+        day_count = (end - start).days
+        daily_trend = [
+            {"date": (start + timedelta(days=offset)).isoformat(),
+             "applications": daily_counts.get((start + timedelta(days=offset)).isoformat(), 0)}
+            for offset in range(day_count)
+        ]
+        status_counts = {
+            row["status"]: row["amount"]
+            for row in db.execute(
+                """SELECT status, COUNT(*) AS amount FROM applications
+                WHERE applied_at >= ? AND applied_at < ? GROUP BY status ORDER BY amount DESC""",
+                (range_start, range_end),
+            )
+        }
+        top_jobs = [dict(row) for row in db.execute(
+            """SELECT j.id AS job_id, j.title, j.company, COUNT(a.id) AS applications
+            FROM applications a JOIN jobs j ON j.id = a.job_id
+            WHERE a.applied_at >= ? AND a.applied_at < ?
+            GROUP BY j.id ORDER BY applications DESC, j.title LIMIT 5""",
+            (range_start, range_end),
+        )]
+        top_technologies = [dict(row) for row in db.execute(
+            """SELECT technology, COUNT(*) AS assessments
+            FROM assessments WHERE created_at >= ? AND created_at < ? AND technology IS NOT NULL
+            GROUP BY technology ORDER BY assessments DESC, technology LIMIT 5""",
+            (range_start, range_end),
+        )]
+        weak_tech_rows = db.execute(
+            """SELECT technology, COUNT(*) AS failed_count
+            FROM assessments WHERE submitted_at >= ? AND submitted_at < ?
+            AND result = 'Failed' AND technology IS NOT NULL
+            GROUP BY technology ORDER BY failed_count DESC LIMIT 5""",
+            (range_start, range_end),
+        ).fetchall()
+        weak_technologies = [{"technology": r["technology"], "failed_count": r["failed_count"]} for r in weak_tech_rows]
+
+        all_platform_apps = db.execute("SELECT status FROM applications").fetchall()
+        total_all_applied = len(all_platform_apps)
+        funnel_stages = [
+            ("Applied", lambda s: True),
+            ("Under Review", lambda s: s not in ("Applied",)),
+            ("Shortlisted", lambda s: s in ("Shortlisted", "Assessment Sent", "Assessment Started", "Assessment Completed", "Round 1 Passed", "Round 1 Failed", "Interview", "Accepted", "Selected")),
+            ("Assessment Completed", lambda s: s in ("Assessment Completed", "Round 1 Passed", "Round 1 Failed", "Interview", "Accepted", "Selected")),
+            ("Round 1 Passed", lambda s: s in ("Round 1 Passed", "Interview", "Accepted", "Selected")),
+            ("Interview", lambda s: s in ("Interview", "Accepted", "Selected")),
+            ("Accepted", lambda s: s in ("Accepted", "Selected")),
+        ]
+        conversion_funnel = [
+            {
+                "stage": stage_name,
+                "count": sum(1 for a in all_platform_apps if matcher(a["status"])),
+                "conversion_rate": round(sum(1 for a in all_platform_apps if matcher(a["status"])) / total_all_applied * 100, 1) if total_all_applied else 0.0,
+            }
+            for stage_name, matcher in funnel_stages
+        ]
+
+        counts["weekly"] = {
+            "range": report_range,
+            "start_date": start.isoformat(),
+            "end_date": (end - timedelta(days=1)).isoformat(),
+            "applications": applications_in_range,
+            "assessments": assessment_counts,
+            "assessments_sent": sent_count,
+            "assessments_completed": completed_count,
+            "completion_rate": round(sent_completed_count / sent_count * 100) if sent_count else 0,
+            "average_score_percentage": round(average_score, 1) if average_score is not None else None,
+            "round1_assessments_completed": round1_completed,
+            "round1_passed": round1_counts.get("Passed", 0),
+            "round1_failed": round1_counts.get("Failed", 0),
+            "round1_pass_rate": round(round1_counts.get("Passed", 0) / round1_completed * 100, 1)
+            if round1_completed else 0,
+            "round1_average_score_percentage": round(round1_average, 1) if round1_average is not None else None,
+            "round1_passed_by_job": [
+                item for item in round1_job_results if item["result"] == "Passed"
+            ],
+            "round1_failed_by_job": [
+                item for item in round1_job_results if item["result"] == "Failed"
+            ],
+            "round1_pass_fail_distribution": {
+                "Passed": round1_counts.get("Passed", 0),
+                "Failed": round1_counts.get("Failed", 0),
+            },
+            "status_counts": status_counts,
+            "daily_trend": daily_trend,
+            "top_jobs": top_jobs,
+            "top_technologies": top_technologies,
+            "weak_technologies": weak_technologies,
+            "conversion_funnel": conversion_funnel,
+        }
+        counts["users_list"] = [dict(row) for row in db.execute("SELECT id, name, email, role, active, created_at FROM users ORDER BY created_at DESC LIMIT 100")]
+        counts["recent_applications"] = [dict(row) for row in db.execute(
+            """SELECT u.name AS candidate_name, j.title, j.company, a.status, a.applied_at
+            FROM applications a JOIN users u ON u.id = a.candidate_id JOIN jobs j ON j.id = a.job_id
+            ORDER BY a.applied_at DESC LIMIT 5"""
+        )]
+    return counts
+
+
+app.mount("/", StaticFiles(directory=FRONTEND_DIR), name="frontend")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    server_port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=server_port, reload=False)

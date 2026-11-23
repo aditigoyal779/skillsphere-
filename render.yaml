@@ -1,0 +1,28 @@
+
+services:
+  - type: web
+    name: skillsphere
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+
+    envVars:
+      - key: SKILLSPHERE_ENV
+        value: production
+
+      - key: SKILLSPHERE_SECRET_KEY
+        generateValue: true
+
+      - key: SKILLSPHERE_PUBLIC_BASE_URL
+        sync: false
+
+      - key: SKILLSPHERE_PROCTORING_REQUIRED
+        value: "true"
+
+      - key: SKILLSPHERE_ROUND1_PASS_PERCENTAGE
+        value: "75"
+
+    disk:
+      name: skillsphere-data
+      mountPath: /app/data
+      sizeGB: 1
