@@ -20,24 +20,6 @@ Built with
 - Backend: Python, FastAPI
 - Frontend: HTML, CSS, JavaScript
 - Database: SQLite
-- Other tools: Docker, Cloudinary (optional), SMTP (optional)
-PDF handling and OCR are also used for document-related features.
-Folder structure
-skillsphere-/
-├── backend/
-│   ├── main.py
-│   └── tests/
-│       └── test_api.py
-├── frontend/
-│   ├── index.html
-│   ├── app.js
-│   ├── styles.css
-│   └── vendor/
-├── .env.example
-├── Dockerfile
-├── docker-compose.yml
-├── render.yaml
-└── requirements.txt
 Run the project locally
 Requirements
 - Python 3.11 or newer
